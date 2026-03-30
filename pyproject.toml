@@ -1,0 +1,12 @@
+[project]
+name = "edge-58-launcher"
+version = "0.1.0"
+description = "启动系统 Edge，使用默认资料并通过 CDP 打开 58"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.52,<2",
+]
+
+[tool.uv]
+package = false

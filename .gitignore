@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual env and uv cache
+.venv/
+.uv-cache/
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# Runtime browser profile
+edge_profile/
