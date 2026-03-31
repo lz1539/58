@@ -200,23 +200,46 @@ def wait_for_candidate_list(page, timeout_seconds: float = 20) -> None:
 
 
 def close_known_dialogs(page) -> None:
+    closed_any = False
     close_button = page.locator(".coupon-dialog .el-dialog__headerbtn")
     if close_button.count() and close_button.first.is_visible():
         close_button.first.click()
         page.wait_for_timeout(300)
+        closed_any = True
     for selector in [
         ".el-dialog__headerbtn",
         ".el-message-box__close",
         ".el-drawer__close-btn",
         ".chat-dialog .close",
+        ".el-notification__closeBtn",
+        ".el-message__closeBtn",
+        ".el-popover__close",
     ]:
         locator = page.locator(selector)
         if locator.count() and locator.first.is_visible():
             try:
                 locator.first.click()
                 page.wait_for_timeout(300)
+                closed_any = True
             except Exception:
                 pass
+    return closed_any
+
+
+def has_chat_popup(page) -> bool:
+    popup_selectors = [
+        ".el-notification",
+        ".el-message",
+        ".el-message-box__wrapper",
+        ".el-dialog__wrapper",
+        ".el-drawer",
+        ".chat-dialog",
+    ]
+    for selector in popup_selectors:
+        locator = page.locator(selector)
+        if locator.count() and locator.first.is_visible():
+            return True
+    return False
 
 
 def get_font_key(page) -> str:
@@ -434,13 +457,18 @@ def click_matching_online_chat(page) -> None:
                     page.wait_for_timeout(500)
                     continue
             page.wait_for_timeout(1200)
-            close_known_dialogs(page)
+            popup_success = has_chat_popup(page)
+            popup_closed = close_known_dialogs(page)
             try:
                 updated_text = button.inner_text().strip()
             except Exception:
                 updated_text = ""
             if updated_text != ONLINE_CHAT_TEXT:
                 last_button_text = updated_text
+                success = True
+                break
+            if popup_success or popup_closed:
+                last_button_text = "弹框已处理"
                 success = True
                 break
         if success:
