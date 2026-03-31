@@ -21,6 +21,7 @@ PROFILE_DIR_NAME = "edge_profile"
 LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
 ONLINE_CHAT_TEXT = "在线沟通"
 REFRESH_INTERVAL_SECONDS = 600
+DEFAULT_RUN_HOURS = 1
 
 
 def find_edge_path() -> Path:
@@ -127,6 +128,37 @@ def wait_for_enter(prompt: str) -> None:
         input(prompt)
     except EOFError:
         pass
+
+
+def prompt_run_duration_seconds() -> float | None:
+    if sys.stdin is None or not sys.stdin.isatty():
+        print(f"当前为非交互环境，默认运行 {DEFAULT_RUN_HOURS} 小时。")
+        return DEFAULT_RUN_HOURS * 3600
+
+    options: list[tuple[str, str, float | None]] = [
+        ("1", "1 小时", 1 * 3600),
+        ("2", "2 小时", 2 * 3600),
+        ("3", "3 小时", 3 * 3600),
+        ("4", "4 小时", 4 * 3600),
+        ("5", "5 小时", 5 * 3600),
+        ("6", "6 小时", 6 * 3600),
+        ("7", "7 小时", 7 * 3600),
+        ("8", "8 小时", 8 * 3600),
+        ("9", "永久执行", None),
+    ]
+    print("请选择本次运行时长：")
+    for key, label, _ in options:
+        default_mark = "（默认）" if key == "1" else ""
+        print(f"{key}. {label}{default_mark}")
+
+    while True:
+        raw = input("请输入选项编号：").strip()
+        if not raw:
+            raw = "1"
+        for key, _, seconds in options:
+            if raw == key:
+                return seconds
+        print("输入无效，请输入 1-9。")
 
 
 def wait_for_cdp_ready(cdp_port: int, edge_process: subprocess.Popen[str], timeout_seconds: float = 15) -> None:
@@ -506,19 +538,34 @@ def run_once(page) -> None:
     click_matching_online_chat(page)
 
 
-def run_periodically(page) -> None:
+def run_periodically(page, run_duration_seconds: float | None) -> None:
     cycle = 1
-    while True:
+    deadline = None if run_duration_seconds is None else time.time() + run_duration_seconds
+    while deadline is None or time.time() < deadline:
         print(f"开始第 {cycle} 轮执行：{time.strftime('%Y-%m-%d %H:%M:%S')}")
         run_once(page)
-        print(f"第 {cycle} 轮执行完成，{REFRESH_INTERVAL_SECONDS // 60} 分钟后刷新重试。")
+        if deadline is None:
+            wait_seconds = REFRESH_INTERVAL_SECONDS
+            print(f"第 {cycle} 轮执行完成，{int(wait_seconds // 60)} 分钟后刷新重试，当前为永久执行。")
+        else:
+            remaining_seconds = deadline - time.time()
+            if remaining_seconds <= 0:
+                break
+            wait_seconds = min(REFRESH_INTERVAL_SECONDS, max(0, remaining_seconds))
+            print(
+                f"第 {cycle} 轮执行完成，"
+                f"{int(wait_seconds // 60)} 分钟后刷新重试，剩余运行 {int(remaining_seconds // 60)} 分钟。"
+            )
         cycle += 1
-        time.sleep(REFRESH_INTERVAL_SECONDS)
+        time.sleep(wait_seconds)
+    if deadline is not None:
+        print("已到达设定运行时间，程序即将退出。")
 
 
 def open_58_with_cdp() -> None:
     edge_path = find_edge_path()
     user_data_dir = get_app_profile_dir()
+    run_duration_seconds = prompt_run_duration_seconds()
     cdp_port = read_existing_cdp_port(user_data_dir) or read_running_edge_cdp_port(user_data_dir)
 
     if cdp_port is None:
@@ -540,13 +587,15 @@ def open_58_with_cdp() -> None:
             raise RuntimeError(f"CDP 连接失败（{CDP_HOST}:{cdp_port}）：{exc}") from exc
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.pages[0] if context.pages else context.new_page()
-        run_periodically(page)
+        if run_duration_seconds is None:
+            print("本次计划永久执行。")
+        else:
+            print(f"本次计划运行 {run_duration_seconds / 3600:g} 小时。")
         print(f"已通过 CDP 接管 Edge，并打开：{TARGET_URL}")
         print(f"Edge 路径：{edge_path}")
         print(f"资料目录：{user_data_dir}")
         print(f"调试地址：http://{CDP_HOST}:{cdp_port}")
-        wait_for_enter("按回车退出程序，浏览器会保持打开...")
-        browser.close()
+        run_periodically(page, run_duration_seconds)
 
     if edge_process and edge_process.poll() is None:
         print("程序退出后不会主动关闭 Edge。")
