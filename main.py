@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 CDP_HOST = "127.0.0.1"
 TARGET_URL = "https://employer.58.com/main/jobmanage"
 PROFILE_DIR_NAME = "edge_profile"
+LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
 
 
 def find_edge_path() -> Path:
@@ -152,6 +153,111 @@ def launch_edge(edge_path: Path, user_data_dir: Path, cdp_port: int) -> subproce
     return subprocess.Popen(args)
 
 
+def is_login_page(url: str) -> bool:
+    normalized = url.lower()
+    return any(keyword in normalized for keyword in LOGIN_URL_KEYWORDS)
+
+
+def wait_for_login(page, timeout_seconds: float = 600) -> None:
+    if not is_login_page(page.url):
+        return
+
+    print(f"当前位于登录页：{page.url}")
+    print("请在 Edge 窗口中完成登录，程序会在登录成功后继续。")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except Exception:
+            pass
+        if not is_login_page(page.url):
+            print(f"检测到已离开登录页：{page.url}")
+            return
+        time.sleep(1)
+    raise TimeoutError("等待用户登录超时，请重新运行程序后再试。")
+
+
+def wait_for_candidate_list(page, timeout_seconds: float = 20) -> None:
+    deadline = time.time() + timeout_seconds
+    selectors = [".list-name-icon", ".list-sex-icon img", "span"]
+    while time.time() < deadline:
+        for frame in page.frames:
+            for selector in selectors:
+                try:
+                    locator = frame.locator(selector)
+                    if locator.count() == 0:
+                        continue
+                    if selector != "span":
+                        return
+                    texts = locator.all_inner_texts()
+                    if any("先生" in text or "女士" in text for text in texts):
+                        return
+                except Exception:
+                    continue
+        time.sleep(1)
+
+
+def analyze_gender_markers(page) -> None:
+    script = r"""
+() => {
+  const rows = Array.from(document.querySelectorAll('.list-name-icon'));
+  const results = [];
+  for (const row of rows) {
+    const nameElement = row.querySelector('.list-name-box span');
+    const sexImage = row.querySelector('.list-sex-icon img');
+    const sourceImage = row.querySelector('.list-from-icon img');
+    const nameText = (nameElement?.textContent || '').trim();
+    const sexIconSrc = sexImage?.getAttribute('src') || '';
+    const sourceIconSrc = sourceImage?.getAttribute('src') || '';
+    if (!nameText) {
+      continue;
+    }
+    results.push({
+      nameText,
+      sexIconSrc,
+      sourceIconSrc,
+      rowHtml: row.outerHTML.slice(0, 1200),
+    });
+    if (results.length >= 10) {
+      break;
+    }
+  }
+
+  return { title: document.title, url: location.href, results };
+}
+"""
+    analyses: list[dict[str, object]] = []
+    for frame in page.frames:
+        try:
+            analysis = frame.evaluate(script)
+        except Exception:
+            continue
+        analyses.append(analysis)
+        results = analysis.get("results", [])
+        if not results:
+            continue
+
+        print("页面分析结果：")
+        print(f"标题：{analysis['title']}")
+        print(f"地址：{analysis['url']}")
+        print("检测到姓名行结构 `.list-name-icon`，可以判断男女。")
+        print("优先判据：姓名文本里的“先生/女士”。")
+        print("第二判据：紧邻的 `.list-sex-icon img` 图片地址。")
+        for index, item in enumerate(results[:5], start=1):
+            print(
+                f"[候选 {index}] 姓名={item['nameText']}, "
+                f"sex_icon={item['sexIconSrc']}, from_icon={item['sourceIconSrc']}"
+            )
+        return
+
+    print("页面分析结果：")
+    if analyses:
+        first = analyses[0]
+        print(f"标题：{first['title']}")
+        print(f"地址：{first['url']}")
+    print("当前页面未抓到姓名行结构，无法判断男女标志是否可用。")
+
+
 def open_58_with_cdp() -> None:
     edge_path = find_edge_path()
     user_data_dir = get_app_profile_dir()
@@ -177,7 +283,11 @@ def open_58_with_cdp() -> None:
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(TARGET_URL, wait_until="domcontentloaded")
+        wait_for_login(page)
+        page.wait_for_load_state("domcontentloaded")
+        wait_for_candidate_list(page)
         page.bring_to_front()
+        analyze_gender_markers(page)
         print(f"已通过 CDP 接管 Edge，并打开：{TARGET_URL}")
         print(f"Edge 路径：{edge_path}")
         print(f"资料目录：{user_data_dir}")
