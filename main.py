@@ -20,6 +20,7 @@ TARGET_URL = "https://employer.58.com/main/jobmanage"
 PROFILE_DIR_NAME = "edge_profile"
 LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
 ONLINE_CHAT_TEXT = "在线沟通"
+REFRESH_INTERVAL_SECONDS = 600
 
 
 def find_edge_path() -> Path:
@@ -496,6 +497,25 @@ def click_matching_online_chat(page) -> None:
             print(f"- {item}")
 
 
+def run_once(page) -> None:
+    page.goto(TARGET_URL, wait_until="domcontentloaded")
+    wait_for_login(page)
+    page.wait_for_load_state("domcontentloaded")
+    wait_for_candidate_list(page)
+    page.bring_to_front()
+    click_matching_online_chat(page)
+
+
+def run_periodically(page) -> None:
+    cycle = 1
+    while True:
+        print(f"开始第 {cycle} 轮执行：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+        run_once(page)
+        print(f"第 {cycle} 轮执行完成，{REFRESH_INTERVAL_SECONDS // 60} 分钟后刷新重试。")
+        cycle += 1
+        time.sleep(REFRESH_INTERVAL_SECONDS)
+
+
 def open_58_with_cdp() -> None:
     edge_path = find_edge_path()
     user_data_dir = get_app_profile_dir()
@@ -520,12 +540,7 @@ def open_58_with_cdp() -> None:
             raise RuntimeError(f"CDP 连接失败（{CDP_HOST}:{cdp_port}）：{exc}") from exc
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(TARGET_URL, wait_until="domcontentloaded")
-        wait_for_login(page)
-        page.wait_for_load_state("domcontentloaded")
-        wait_for_candidate_list(page)
-        page.bring_to_front()
-        click_matching_online_chat(page)
+        run_periodically(page)
         print(f"已通过 CDP 接管 Edge，并打开：{TARGET_URL}")
         print(f"Edge 路径：{edge_path}")
         print(f"资料目录：{user_data_dir}")
