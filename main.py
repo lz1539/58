@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 
 
 CDP_HOST = "127.0.0.1"
-TARGET_URL = "https://www.58.com/"
+TARGET_URL = "https://employer.58.com/main/jobmanage"
 PROFILE_DIR_NAME = "edge_profile"
 
 

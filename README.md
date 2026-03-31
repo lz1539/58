@@ -5,7 +5,7 @@
 1. 查找当前 Windows 上安装的 `msedge.exe`
 2. 使用 `exe` 同目录下的独立 Edge 资料目录
 3. 以自动分配的 `--remote-debugging-port` 启动 Edge
-4. 通过 CDP 接管浏览器并打开 `https://www.58.com/`
+4. 通过 CDP 接管浏览器并打开 `https://employer.58.com/main/jobmanage`
 
 ## 运行
 
