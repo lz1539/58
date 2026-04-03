@@ -17,7 +17,6 @@ from playwright.sync_api import sync_playwright
 
 CDP_HOST = "127.0.0.1"
 TARGET_URL = "https://employer.58.com/main/jobmanage"
-EDGE_USER_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data"
 EDGE_PROFILE_DIRECTORY = "Default"
 LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
 ONLINE_CHAT_TEXT = "在线沟通"
@@ -38,7 +37,11 @@ def find_edge_path() -> Path:
 
 
 def get_edge_user_data_dir() -> Path:
-    return EDGE_USER_DATA_DIR
+    if getattr(sys, "frozen", False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+    return base_dir / "edge_profile"
 
 
 def build_version_endpoint(cdp_port: int) -> str:
@@ -120,6 +123,77 @@ Get-CimInstance Win32_Process |
     return None
 
 
+def ensure_compatible_edge_state(user_data_dir: Path) -> None:
+    if os.name != "nt":
+        return
+
+    normalized_user_data_dir = str(user_data_dir).lower().replace("\\", "/")
+    script = """
+$processes = Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq 'msedge.exe' } |
+  Select-Object ProcessId, CommandLine
+
+if ($processes) {
+  $processes | ForEach-Object {
+    $line = $_.CommandLine
+    if (-not $line) { $line = '' }
+    Write-Output (\"{0}`t{1}\" -f $_.ProcessId, $line)
+  }
+}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+
+    running_edges = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not running_edges:
+        return
+
+    incompatible_edges: list[tuple[str, str]] = []
+    for line in running_edges:
+        parts = line.split("\t", 1)
+        process_id = parts[0] if parts else ""
+        command_line = parts[1] if len(parts) > 1 else ""
+        normalized = command_line.lower().replace("\\", "/")
+        if f"--user-data-dir={normalized_user_data_dir}" not in normalized:
+            continue
+        if f"--profile-directory={EDGE_PROFILE_DIRECTORY.lower()}" in normalized and "--remote-debugging-port=" in normalized:
+            continue
+        incompatible_edges.append((process_id, command_line))
+
+    if not incompatible_edges:
+        return
+
+    if sys.stdin is None or not sys.stdin.isatty():
+        raise RuntimeError("检测到普通 Edge 或其他占用实例正在运行，请先彻底关闭所有 Edge 窗口后再启动程序。")
+
+    print(f"检测到 {len(incompatible_edges)} 个 Edge 占用实例。")
+    answer = input("是否由程序自动关闭这些 Edge 进程并继续？(y/N)：").strip().lower()
+    if answer not in {"y", "yes"}:
+        raise RuntimeError("检测到普通 Edge 或其他占用实例正在运行，请先彻底关闭所有 Edge 窗口后再启动程序。")
+
+    for process_id, _ in incompatible_edges:
+        if not process_id:
+            continue
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {process_id} -Force"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"自动关闭 Edge 进程失败：{process_id}，{exc}") from exc
+
+    time.sleep(1)
+
+
 def wait_for_enter(prompt: str) -> None:
     if sys.stdin is None or not sys.stdin.isatty():
         return
@@ -160,12 +234,22 @@ def prompt_run_duration_seconds() -> float | None:
         print("输入无效，请输入 1-9。")
 
 
-def wait_for_cdp_ready(cdp_port: int, edge_process: subprocess.Popen[str], timeout_seconds: float = 15) -> None:
+def wait_for_cdp_ready(
+    cdp_port: int,
+    edge_process: subprocess.Popen[str],
+    user_data_dir: Path,
+    timeout_seconds: float = 20,
+) -> int:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         version_data = read_cdp_version(cdp_port)
         if version_data and version_data.get("webSocketDebuggerUrl"):
-            return
+            return cdp_port
+        active_cdp_port = read_existing_cdp_port(user_data_dir) or read_running_edge_cdp_port(user_data_dir)
+        if active_cdp_port is not None:
+            version_data = read_cdp_version(active_cdp_port)
+            if version_data and version_data.get("webSocketDebuggerUrl"):
+                return active_cdp_port
         time.sleep(0.5)
     raise TimeoutError(
         f"未等待到 Edge 的 CDP 端口就绪（{CDP_HOST}:{cdp_port}）。"
@@ -532,6 +616,9 @@ def click_matching_online_chat(page) -> None:
 def run_once(page, login_timeout_seconds: float | None = None) -> None:
     page.goto(TARGET_URL, wait_until="domcontentloaded")
     wait_for_login(page, timeout_seconds=login_timeout_seconds)
+    if TARGET_URL not in page.url:
+        print("登录完成，正在进入人才管理页。")
+        page.goto(TARGET_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("domcontentloaded")
     wait_for_candidate_list(page)
     page.bring_to_front()
@@ -572,13 +659,14 @@ def run_periodically(context, page, run_duration_seconds: float | None) -> None:
 def open_58_with_cdp() -> None:
     edge_path = find_edge_path()
     user_data_dir = get_edge_user_data_dir()
+    ensure_compatible_edge_state(user_data_dir)
     run_duration_seconds = prompt_run_duration_seconds()
     cdp_port = read_existing_cdp_port(user_data_dir) or read_running_edge_cdp_port(user_data_dir)
 
     if cdp_port is None:
         cdp_port = choose_cdp_port()
         edge_process = launch_edge(edge_path, user_data_dir, cdp_port)
-        wait_for_cdp_ready(cdp_port, edge_process)
+        cdp_port = wait_for_cdp_ready(cdp_port, edge_process, user_data_dir)
     else:
         edge_process = None
 
