@@ -17,7 +17,8 @@ from playwright.sync_api import sync_playwright
 
 CDP_HOST = "127.0.0.1"
 TARGET_URL = "https://employer.58.com/main/jobmanage"
-PROFILE_DIR_NAME = "edge_profile"
+EDGE_USER_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data"
+EDGE_PROFILE_DIRECTORY = "Default"
 LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
 ONLINE_CHAT_TEXT = "在线沟通"
 REFRESH_INTERVAL_SECONDS = 600
@@ -36,12 +37,8 @@ def find_edge_path() -> Path:
     raise FileNotFoundError("未找到系统 Edge，请确认 Microsoft Edge 已安装。")
 
 
-def get_app_profile_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        base_dir = Path(sys.executable).resolve().parent
-    else:
-        base_dir = Path(__file__).resolve().parent
-    return base_dir / PROFILE_DIR_NAME
+def get_edge_user_data_dir() -> Path:
+    return EDGE_USER_DATA_DIR
 
 
 def build_version_endpoint(cdp_port: int) -> str:
@@ -91,7 +88,7 @@ def read_running_edge_cdp_port(user_data_dir: Path) -> int | None:
     if os.name != "nt":
         return None
 
-    profile_name = user_data_dir.name.lower()
+    normalized_user_data_dir = str(user_data_dir).lower().replace("\\", "/")
     script = rf"""
 Get-CimInstance Win32_Process |
   Where-Object {{ $_.Name -eq 'msedge.exe' -and $_.CommandLine }} |
@@ -108,8 +105,10 @@ Get-CimInstance Win32_Process |
         return None
 
     for command_line in result.stdout.splitlines():
-        normalized = command_line.lower()
-        if profile_name not in normalized:
+        normalized = command_line.lower().replace("\\", "/")
+        if f"--user-data-dir={normalized_user_data_dir}" not in normalized:
+            continue
+        if f"--profile-directory={EDGE_PROFILE_DIRECTORY.lower()}" not in normalized:
             continue
         match = re.search(r"--remote-debugging-port=(\d+)", command_line)
         if not match:
@@ -181,6 +180,7 @@ def launch_edge(edge_path: Path, user_data_dir: Path, cdp_port: int) -> subproce
         str(edge_path),
         f"--remote-debugging-port={cdp_port}",
         f"--user-data-dir={user_data_dir}",
+        f"--profile-directory={EDGE_PROFILE_DIRECTORY}",
         "--no-first-run",
         "--no-default-browser-check",
         "about:blank",
@@ -193,14 +193,14 @@ def is_login_page(url: str) -> bool:
     return any(keyword in normalized for keyword in LOGIN_URL_KEYWORDS)
 
 
-def wait_for_login(page, timeout_seconds: float = 600) -> None:
+def wait_for_login(page, timeout_seconds: float | None = 600) -> None:
     if not is_login_page(page.url):
         return
 
     print(f"当前位于登录页：{page.url}")
     print("请在 Edge 窗口中完成登录，程序会在登录成功后继续。")
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
+    deadline = None if timeout_seconds is None else time.time() + timeout_seconds
+    while deadline is None or time.time() < deadline:
         try:
             page.wait_for_load_state("domcontentloaded", timeout=1000)
         except Exception:
@@ -529,21 +529,28 @@ def click_matching_online_chat(page) -> None:
             print(f"- {item}")
 
 
-def run_once(page) -> None:
+def run_once(page, login_timeout_seconds: float | None = None) -> None:
     page.goto(TARGET_URL, wait_until="domcontentloaded")
-    wait_for_login(page)
+    wait_for_login(page, timeout_seconds=login_timeout_seconds)
     page.wait_for_load_state("domcontentloaded")
     wait_for_candidate_list(page)
     page.bring_to_front()
     click_matching_online_chat(page)
 
 
-def run_periodically(page, run_duration_seconds: float | None) -> None:
+def run_periodically(context, page, run_duration_seconds: float | None) -> None:
     cycle = 1
     deadline = None if run_duration_seconds is None else time.time() + run_duration_seconds
     while deadline is None or time.time() < deadline:
         print(f"开始第 {cycle} 轮执行：{time.strftime('%Y-%m-%d %H:%M:%S')}")
-        run_once(page)
+        if page.is_closed():
+            page = context.new_page()
+
+        remaining_seconds = None if deadline is None else max(0, deadline - time.time())
+        try:
+            run_once(page, login_timeout_seconds=remaining_seconds)
+        except Exception as exc:
+            print(f"第 {cycle} 轮执行失败：{exc}")
         if deadline is None:
             wait_seconds = REFRESH_INTERVAL_SECONDS
             print(f"第 {cycle} 轮执行完成，{int(wait_seconds // 60)} 分钟后刷新重试，当前为永久执行。")
@@ -564,7 +571,7 @@ def run_periodically(page, run_duration_seconds: float | None) -> None:
 
 def open_58_with_cdp() -> None:
     edge_path = find_edge_path()
-    user_data_dir = get_app_profile_dir()
+    user_data_dir = get_edge_user_data_dir()
     run_duration_seconds = prompt_run_duration_seconds()
     cdp_port = read_existing_cdp_port(user_data_dir) or read_running_edge_cdp_port(user_data_dir)
 
@@ -594,8 +601,9 @@ def open_58_with_cdp() -> None:
         print(f"已通过 CDP 接管 Edge，并打开：{TARGET_URL}")
         print(f"Edge 路径：{edge_path}")
         print(f"资料目录：{user_data_dir}")
+        print(f"Profile 目录：{EDGE_PROFILE_DIRECTORY}")
         print(f"调试地址：http://{CDP_HOST}:{cdp_port}")
-        run_periodically(page, run_duration_seconds)
+        run_periodically(context, page, run_duration_seconds)
 
     if edge_process and edge_process.poll() is None:
         print("程序退出后不会主动关闭 Edge。")
