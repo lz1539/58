@@ -19,9 +19,26 @@ CDP_HOST = "127.0.0.1"
 TARGET_URL = "https://employer.58.com/main/jobmanage"
 EDGE_PROFILE_DIRECTORY = "Default"
 LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
-ONLINE_CHAT_TEXT = "在线沟通"
+ONLINE_CHAT_TEXT_CANDIDATES = ("在线沟通", "立即沟通", "马上沟通", "发起沟通")
+CHAT_SUCCESS_TEXT_CANDIDATES = ("继续沟通", "立即回复", "去沟通", "已沟通")
+CHAT_FAILURE_KEYWORDS = ("开通", "购买", "受限", "上限", "失败", "异常", "不可", "暂停", "稍后", "请先登录")
+ROW_SELECTORS = (
+    ".interested-list",
+    "[class*='interested'][class*='list']",
+    "[class*='resume'][class*='list'] [class*='item']",
+    "[class*='candidate'][class*='list'] [class*='item']",
+)
+ROW_FALLBACK_SELECTORS = (
+    ".interested-list[infoid]",
+    ".interested-list[resumeid]",
+    "[infoid][class*='list']",
+    "[resumeid][class*='list']",
+    "[infoid]",
+    "[resumeid]",
+)
 REFRESH_INTERVAL_SECONDS = 600
 DEFAULT_RUN_HOURS = 1
+AGE_GLYPH_MAP_CACHE: dict[str, dict[str, str]] = {}
 
 
 def find_edge_path() -> Path:
@@ -221,7 +238,10 @@ if ($processes) {
         raise RuntimeError("检测到普通 Edge 或其他占用实例正在运行，请先彻底关闭所有 Edge 窗口后再启动程序。")
 
     print(f"检测到 {len(incompatible_edges)} 个 Edge 占用实例。")
-    answer = input("是否由程序自动关闭这些 Edge 进程并继续？(y/N)：").strip().lower()
+    try:
+        answer = input("是否由程序自动关闭这些 Edge 进程并继续？(y/N)：").strip().lower()
+    except EOFError:
+        raise RuntimeError("检测到普通 Edge 或其他占用实例正在运行，请先彻底关闭所有 Edge 窗口后再启动程序。") from None
     if answer not in {"y", "yes"}:
         raise RuntimeError("检测到普通 Edge 或其他占用实例正在运行，请先彻底关闭所有 Edge 窗口后再启动程序。")
 
@@ -272,7 +292,11 @@ def prompt_run_duration_seconds() -> float | None:
         print(f"{key}. {label}{default_mark}")
 
     while True:
-        raw = input("请输入选项编号：").strip()
+        try:
+            raw = input("请输入选项编号：").strip()
+        except EOFError:
+            print(f"\n未读取到输入，默认运行 {DEFAULT_RUN_HOURS} 小时。")
+            return DEFAULT_RUN_HOURS * 3600
         if not raw:
             raw = "1"
         for key, _, seconds in options:
@@ -314,7 +338,6 @@ def launch_edge(edge_path: Path, user_data_dir: Path, cdp_port: int) -> subproce
         f"--profile-directory={EDGE_PROFILE_DIRECTORY}",
         "--no-first-run",
         "--no-default-browser-check",
-        "about:blank",
     ]
     return subprocess.Popen(args)
 
@@ -324,9 +347,30 @@ def is_login_page(url: str) -> bool:
     return any(keyword in normalized for keyword in LOGIN_URL_KEYWORDS)
 
 
-def wait_for_login(page, timeout_seconds: float | None = 600) -> None:
+def pick_active_page(context, fallback_page=None):
+    pages = [page for page in context.pages if not page.is_closed()]
+    if fallback_page is not None and not fallback_page.is_closed():
+        pages.insert(0, fallback_page)
+
+    unique_pages = list(dict.fromkeys(pages))
+    if not unique_pages:
+        return fallback_page if fallback_page is not None else context.new_page()
+
+    for page in unique_pages:
+        if TARGET_URL in page.url:
+            return page
+    for page in unique_pages:
+        if page.url.startswith("http") and not is_login_page(page.url):
+            return page
+    for page in unique_pages:
+        if page.url.startswith("http"):
+            return page
+    return unique_pages[0]
+
+
+def wait_for_login(context, page, timeout_seconds: float | None = 600):
     if not is_login_page(page.url):
-        return
+        return page
 
     print(f"当前位于登录页：{page.url}")
     print("请在 Edge 窗口中完成登录，程序会在登录成功后继续。")
@@ -336,41 +380,90 @@ def wait_for_login(page, timeout_seconds: float | None = 600) -> None:
             page.wait_for_load_state("domcontentloaded", timeout=1000)
         except Exception:
             pass
-        if not is_login_page(page.url):
-            print(f"检测到已离开登录页：{page.url}")
-            return
+        active_page = pick_active_page(context, fallback_page=page)
+        if not is_login_page(active_page.url):
+            print(f"检测到已离开登录页：{active_page.url}")
+            return active_page
         time.sleep(1)
     raise TimeoutError("等待用户登录超时，请重新运行程序后再试。")
 
 
+def normalize_text(value: object) -> str:
+    text = unescape(str(value or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_int(value: object) -> int | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    match = re.search(r"-?\d+", text)
+    if not match:
+        return None
+    return int(match.group())
+
+
+def normalize_sex(value: object) -> str | None:
+    text = normalize_text(value).lower()
+    if not text:
+        return None
+    if text in {"男", "先生", "male", "m", "1"} or "男" in text or "先生" in text:
+        return "男"
+    if text in {"女", "女士", "female", "f", "0"} or "女" in text or "女士" in text:
+        return "女"
+    return None
+
+
+def is_actionable_chat_text(text: object) -> bool:
+    normalized = normalize_text(text)
+    return bool(normalized) and any(keyword in normalized for keyword in ONLINE_CHAT_TEXT_CANDIDATES)
+
+
+def is_success_chat_text(text: object) -> bool:
+    normalized = normalize_text(text)
+    return bool(normalized) and any(keyword in normalized for keyword in CHAT_SUCCESS_TEXT_CANDIDATES)
+
+
+def classify_feedback_texts(texts: list[str]) -> str:
+    merged = " ".join(normalize_text(text) for text in texts if normalize_text(text))
+    if not merged:
+        return "unknown"
+    if any(keyword in merged for keyword in CHAT_FAILURE_KEYWORDS):
+        return "failure"
+    if any(keyword in merged for keyword in CHAT_SUCCESS_TEXT_CANDIDATES):
+        return "success"
+    return "unknown"
+
+
 def wait_for_candidate_list(page, timeout_seconds: float = 20) -> None:
     deadline = time.time() + timeout_seconds
-    selectors = [".list-name-icon", ".list-sex-icon img", "span"]
+    ready_keywords = ("先生", "女士", "在线沟通", "继续沟通", "人才管理")
     while time.time() < deadline:
         for frame in page.frames:
-            for selector in selectors:
+            for selector in ROW_SELECTORS:
                 try:
                     locator = frame.locator(selector)
-                    if locator.count() == 0:
-                        continue
-                    if selector != "span":
-                        return
-                    texts = locator.all_inner_texts()
-                    if any("先生" in text or "女士" in text for text in texts):
+                    if locator.count() > 0:
                         return
                 except Exception:
                     continue
+            try:
+                spans = frame.locator("span, button, a")
+                if spans.count() == 0:
+                    continue
+                texts = [normalize_text(text) for text in spans.all_inner_texts()]
+                if any(any(keyword in text for keyword in ready_keywords) for text in texts):
+                    return
+            except Exception:
+                continue
         time.sleep(1)
+    raise TimeoutError("等待人才列表超时，未检测到可操作的列表内容。")
 
 
-def close_known_dialogs(page) -> None:
+def close_known_dialogs(page) -> bool:
     closed_any = False
-    close_button = page.locator(".coupon-dialog .el-dialog__headerbtn")
-    if close_button.count() and close_button.first.is_visible():
-        close_button.first.click()
-        page.wait_for_timeout(300)
-        closed_any = True
-    for selector in [
+    selectors = [
+        ".coupon-dialog .el-dialog__headerbtn",
         ".el-dialog__headerbtn",
         ".el-message-box__close",
         ".el-drawer__close-btn",
@@ -378,19 +471,27 @@ def close_known_dialogs(page) -> None:
         ".el-notification__closeBtn",
         ".el-message__closeBtn",
         ".el-popover__close",
-    ]:
+        "[class*='dialog'] [class*='close']",
+        "[class*='popup'] [class*='close']",
+    ]
+    for selector in selectors:
         locator = page.locator(selector)
-        if locator.count() and locator.first.is_visible():
+        count = min(locator.count(), 3)
+        for index in range(count):
             try:
-                locator.first.click()
+                button = locator.nth(index)
+                if not button.is_visible():
+                    continue
+                button.click(timeout=1000)
                 page.wait_for_timeout(300)
                 closed_any = True
             except Exception:
-                pass
+                continue
     return closed_any
 
 
-def has_chat_popup(page) -> bool:
+def read_visible_feedback_texts(page) -> list[str]:
+    texts: list[str] = []
     popup_selectors = [
         ".el-notification",
         ".el-message",
@@ -398,15 +499,27 @@ def has_chat_popup(page) -> bool:
         ".el-dialog__wrapper",
         ".el-drawer",
         ".chat-dialog",
+        "[class*='dialog']",
+        "[class*='popup']",
+        "[role='dialog']",
     ]
     for selector in popup_selectors:
         locator = page.locator(selector)
-        if locator.count() and locator.first.is_visible():
-            return True
-    return False
+        count = min(locator.count(), 3)
+        for index in range(count):
+            try:
+                element = locator.nth(index)
+                if not element.is_visible():
+                    continue
+                text = normalize_text(element.inner_text())
+                if text and text not in texts:
+                    texts.append(text)
+            except Exception:
+                continue
+    return texts
 
 
-def get_font_key(page) -> str:
+def get_font_key(page) -> str | None:
     script = r"""
 () => {
   const entries = performance.getEntriesByType('resource').map(x => x.name);
@@ -424,33 +537,77 @@ def get_font_key(page) -> str:
 }
 """
     font_key = page.evaluate(script)
-    if not font_key:
-        raise RuntimeError("未找到页面字体 font key，无法解码年龄。")
-    return str(font_key)
+    normalized = normalize_text(font_key)
+    return normalized or None
 
 
-def fetch_candidate_items(page, font_key: str) -> list[dict[str, object]]:
-    api_url = (
-        "https://zpim.58.com/resumepaychat/paychatlist"
-        f"?jslState=0&infoId=0&imSource=-1&page=1&pageSize=10&chatState=0"
-        f"&fontkey={font_key}"
-        "&from=pc,hx_manage_interestedlist,other"
-        "&slotId=pc_hx_manage_interestedlist_list&businessType=0&hxProfession=1&deliveryState=0"
-    )
+def get_age_font_family(page) -> str | None:
+    script = r"""
+() => {
+  const selectors = ['.list-info-age', '[class*="age"]', '.interested-list [class*="info-item"]'];
+  for (const selector of selectors) {
+    const elements = Array.from(document.querySelectorAll(selector));
+    for (const element of elements) {
+      const text = (element.innerText || element.textContent || '').trim();
+      if (!text || !text.includes('岁')) continue;
+      const fontFamily = getComputedStyle(element).fontFamily || '';
+      if (fontFamily.trim()) return fontFamily;
+    }
+  }
+  return '';
+}
+"""
+    font_family = normalize_text(page.evaluate(script))
+    return font_family or None
+
+
+def build_paychat_api_url(font_key: str | None) -> str:
+    params = [
+        "jslState=0",
+        "infoId=0",
+        "imSource=-1",
+        "page=1",
+        "pageSize=10",
+        "chatState=0",
+        "from=pc,hx_manage_interestedlist,other",
+        "slotId=pc_hx_manage_interestedlist_list",
+        "businessType=0",
+        "hxProfession=1",
+        "deliveryState=0",
+    ]
+    if font_key:
+        params.append(f"fontkey={font_key}")
+    return "https://zpim.58.com/resumepaychat/paychatlist?" + "&".join(params)
+
+
+def fetch_candidate_items(page, font_key: str | None) -> list[dict[str, object]]:
+    api_url = build_paychat_api_url(font_key)
     script = """
     async (url) => {
       const resp = await fetch(url, { credentials: 'include' });
+      if (!resp.ok) {
+        return { __fetch_error__: `${resp.status} ${resp.statusText}` };
+      }
       return await resp.json();
     }
     """
     payload = page.evaluate(script, api_url)
-    items = payload.get("data", {}).get("items", [])
+    if not isinstance(payload, dict):
+        raise RuntimeError("人才列表接口返回异常，返回结果不是对象。")
+    if payload.get("__fetch_error__"):
+        raise RuntimeError(f"人才列表接口请求失败：{payload['__fetch_error__']}")
+    data = payload.get("data")
+    if data is None:
+        return []
+    if not isinstance(data, dict):
+        raise RuntimeError(f"人才列表接口返回异常，data 不是对象：{payload}")
+    items = data.get("items", [])
     if not isinstance(items, list):
-        raise RuntimeError("人才列表接口返回异常，未获取到 items。")
+        raise RuntimeError(f"人才列表接口返回异常，未获取到 items：{payload}")
     return items
 
 
-def build_age_glyph_map(page, age_values: list[str]) -> dict[str, str]:
+def build_age_glyph_map(page, age_values: list[str], font_key: str | None = None) -> dict[str, str]:
     glyphs: list[str] = []
     for age_value in age_values:
         decoded = unescape(age_value)
@@ -463,10 +620,19 @@ def build_age_glyph_map(page, age_values: list[str]) -> dict[str, str]:
     if not glyphs:
         return {}
 
+    cache_key = font_key or "__default__"
+    cached_map = AGE_GLYPH_MAP_CACHE.get(cache_key, {})
+    missing_glyphs = [glyph for glyph in glyphs if glyph not in cached_map]
+    if not missing_glyphs:
+        return {glyph: cached_map[glyph] for glyph in glyphs if glyph in cached_map}
+
+    font_family = get_age_font_family(page)
+    if not font_family:
+        return {glyph: cached_map[glyph] for glyph in glyphs if glyph in cached_map}
+
     script = r"""
-(glyphs) => {
-  const ageElement = document.querySelector('.list-info-age');
-  const fontFamily = ageElement ? getComputedStyle(ageElement).fontFamily : '';
+(input) => {
+  const { glyphs, fontFamily } = input;
   if (!fontFamily) {
     return {};
   }
@@ -516,8 +682,12 @@ def build_age_glyph_map(page, age_values: list[str]) -> dict[str, str]:
   return mapping;
 }
 """
-    mapping = page.evaluate(script, glyphs)
-    return {str(k): str(v) for k, v in mapping.items()}
+    mapping = page.evaluate(script, {"glyphs": missing_glyphs, "fontFamily": font_family})
+    normalized_mapping = {str(k): str(v) for k, v in mapping.items()}
+    merged_mapping = dict(cached_map)
+    merged_mapping.update(normalized_mapping)
+    AGE_GLYPH_MAP_CACHE[cache_key] = merged_mapping
+    return {glyph: merged_mapping[glyph] for glyph in glyphs if glyph in merged_mapping}
 
 
 def decode_age(age_value: str, glyph_map: dict[str, str]) -> int | None:
@@ -542,75 +712,270 @@ def decode_age(age_value: str, glyph_map: dict[str, str]) -> int | None:
     return int("".join(age_digits))
 
 
-def find_target_row(page, target_name: str, target_age: int, glyph_map: dict[str, str]):
-    rows = page.locator(".interested-list")
+def infer_age_from_text(text: str, glyph_map: dict[str, str]) -> int | None:
+    normalized = normalize_text(text)
+    if not normalized:
+        return None
+    match = re.search(r"(\d{1,2})\s*岁", normalized)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"([^\s]{1,3})\s*岁", normalized)
+    if match:
+        return decode_age(match.group(1) + "岁", glyph_map)
+    return None
+
+
+def pick_item_value(item: dict[str, object], *keys: str) -> object:
+    for key in keys:
+        if key in item and item[key] not in (None, ""):
+            return item[key]
+    return ""
+
+
+def normalize_candidate_from_api(item: dict[str, object], glyph_map: dict[str, str]) -> dict[str, object]:
+    name = normalize_text(pick_item_value(item, "name", "realName", "resumeName", "userName"))
+    sex = normalize_sex(pick_item_value(item, "sex", "gender", "sexDesc", "genderDesc"))
+    age_source = pick_item_value(item, "age", "ageDesc", "ageText")
+    age = decode_age(str(age_source), glyph_map)
+    if age is None:
+        age = parse_int(age_source)
+    chat_state = parse_int(pick_item_value(item, "chatState", "imState", "status"))
+    chat_text = normalize_text(pick_item_value(item, "chatStateDesc", "statusDesc", "buttonText"))
+    return {
+        "name": name,
+        "sex": sex,
+        "age": age,
+        "infoid": normalize_text(pick_item_value(item, "infoId", "resumeId", "id")),
+        "chat_state": chat_state,
+        "chat_text": chat_text,
+        "raw": item,
+    }
+
+
+def get_candidate_rows(page):
+    for selector in ROW_SELECTORS:
+        rows = page.locator(selector)
+        if rows.count() > 0:
+            return rows
+    return page.locator(".interested-list")
+
+
+def extract_row_snapshot(row, glyph_map: dict[str, str]) -> dict[str, object]:
+    script = r"""
+(node) => {
+  const textOf = (selectorList) => {
+    for (const selector of selectorList) {
+      const element = node.querySelector(selector);
+      if (element && element.innerText && element.innerText.trim()) {
+        return element.innerText.trim();
+      }
+    }
+    return '';
+  };
+  const clickable = Array.from(node.querySelectorAll('button, a, [role="button"]'))
+    .map((element) => (element.innerText || element.textContent || '').trim())
+    .filter(Boolean);
+  const html = node.outerHTML || '';
+  const attrs = [
+    node.getAttribute('infoid'),
+    node.getAttribute('resumeid'),
+    node.getAttribute('data-infoid'),
+    node.getAttribute('data-id'),
+    node.id,
+  ]
+    .filter(Boolean);
+  const hrefs = Array.from(node.querySelectorAll('a[href]')).map((item) => item.getAttribute('href') || '');
+  return {
+    name: textOf(['.list-name-box span', '[class*="name"] span', '[class*="name"]']),
+    ageText: textOf(['.list-info-age', '[class*="age"]']),
+    sexText: textOf(['.list-sex-icon', '[class*="sex"]', '[class*="gender"]']),
+    text: (node.innerText || '').trim(),
+    buttonTexts: clickable,
+    html,
+    hints: attrs.concat(hrefs),
+    infoId: node.getAttribute('infoid') || node.getAttribute('data-infoid') || node.getAttribute('data-id') || '',
+    resumeId: node.getAttribute('resumeid') || '',
+  };
+}
+"""
+    snapshot = row.evaluate(script)
+    full_text = normalize_text(snapshot.get("text", ""))
+    age_text = normalize_text(snapshot.get("ageText", ""))
+    sex_text = normalize_text(snapshot.get("sexText", ""))
+    button_texts = [normalize_text(text) for text in snapshot.get("buttonTexts", []) if normalize_text(text)]
+    combined_hint_text = " ".join([normalize_text(snapshot.get("html", ""))] + [normalize_text(value) for value in snapshot.get("hints", [])])
+    infoid_match = re.search(r"(?i)(?:infoid|resumeid|data-infoid|data-id)[^0-9]{0,8}(\d{5,})", combined_hint_text)
+    return {
+        "name": normalize_text(snapshot.get("name", "")),
+        "age_text": age_text,
+        "sex": normalize_sex(sex_text or full_text),
+        "age": infer_age_from_text(age_text or full_text, glyph_map),
+        "button_texts": button_texts,
+        "button_text": next((text for text in button_texts if "沟通" in text), button_texts[0] if button_texts else ""),
+        "text": full_text,
+        "infoid": normalize_text(snapshot.get("infoId", "")) or (infoid_match.group(1) if infoid_match else ""),
+        "resumeid": normalize_text(snapshot.get("resumeId", "")),
+    }
+
+
+def build_page_candidates(page, glyph_map: dict[str, str]) -> list[dict[str, object]]:
+    selectors = list(dict.fromkeys([*ROW_SELECTORS, *ROW_FALLBACK_SELECTORS]))
+
+    for _ in range(3):
+        for selector in selectors:
+            best_candidates: list[dict[str, object]] = []
+            for frame in page.frames:
+                try:
+                    rows = frame.locator(selector)
+                    total = rows.count()
+                except Exception:
+                    continue
+
+                if total <= 0:
+                    continue
+
+                current_candidates: list[dict[str, object]] = []
+                for index in range(total):
+                    row = rows.nth(index)
+                    try:
+                        snapshot = extract_row_snapshot(row, glyph_map)
+                    except Exception:
+                        continue
+
+                    has_identity = bool(snapshot.get("infoid") or snapshot.get("resumeid") or snapshot.get("name"))
+                    has_button = bool(snapshot.get("button_text"))
+                    if not has_identity and not has_button:
+                        continue
+
+                    snapshot["row"] = row
+                    snapshot["index"] = index
+                    current_candidates.append(snapshot)
+
+                if len(current_candidates) > len(best_candidates):
+                    best_candidates = current_candidates
+
+            if best_candidates:
+                return best_candidates
+        page.wait_for_timeout(1000)
+    return []
+
+
+def merge_candidate(page_candidate: dict[str, object], api_candidate: dict[str, object] | None) -> dict[str, object]:
+    merged = dict(page_candidate)
+    if not api_candidate:
+        return merged
+    for key in ("name", "sex", "age", "infoid"):
+        if merged.get(key) in (None, "", 0):
+            merged[key] = api_candidate.get(key)
+    merged["api_chat_state"] = api_candidate.get("chat_state")
+    merged["api_chat_text"] = api_candidate.get("chat_text")
+    return merged
+
+
+def is_target_candidate(candidate: dict[str, object]) -> tuple[bool, str]:
+    button_text = normalize_text(candidate.get("button_text", ""))
+    if not is_actionable_chat_text(button_text):
+        return False, f"按钮不是可发起状态：{button_text or '空'}"
+
+    sex = normalize_sex(candidate.get("sex", ""))
+    if sex != "男":
+        return False, f"性别不匹配：{sex or '未知'}"
+
+    age = candidate.get("age")
+    if not isinstance(age, int):
+        return False, "年龄无法识别"
+    if not (18 <= age <= 55):
+        return False, f"年龄不在范围内：{age}"
+
+    chat_state = candidate.get("api_chat_state")
+    if isinstance(chat_state, int) and chat_state not in (0,):
+        return False, f"接口 chatState 不可点击：{chat_state}"
+    return True, ""
+
+
+def find_target_row(page, target: dict[str, object], glyph_map: dict[str, str]):
+    rows = get_candidate_rows(page)
     total = rows.count()
     for index in range(total):
         row = rows.nth(index)
         try:
-            name = row.locator(".list-name-box span").first.inner_text().strip()
+            snapshot = extract_row_snapshot(row, glyph_map)
         except Exception:
             continue
-        if name != target_name:
+        target_infoid = normalize_text(target.get("infoid", ""))
+        if target_infoid and snapshot.get("infoid") == target_infoid:
+            button = row.locator("button, a, [role='button']").filter(has_text=re.compile("沟通"))
+            if button.count() > 0:
+                return row, button.first
+        target_name = normalize_text(target.get("name", ""))
+        target_age = target.get("age")
+        if snapshot.get("name") != target_name:
             continue
-
-        try:
-            age_text = row.locator(".list-info-age").first.inner_text().strip()
-        except Exception:
-            age_text = ""
-        age = decode_age(age_text, glyph_map)
-        if age != target_age:
+        if isinstance(target_age, int) and snapshot.get("age") not in (None, target_age):
             continue
-
-        button = row.locator("button.list-chat-btn").first
+        button = row.locator("button, a, [role='button']").filter(has_text=re.compile("沟通"))
+        if button.count() == 0:
+            button = row.locator("button.list-chat-btn")
         if button.count() == 0:
             continue
-        return row, button
+        return row, button.first
     return None, None
 
 
 def click_matching_online_chat(page) -> None:
     close_known_dialogs(page)
     font_key = get_font_key(page)
-    items = fetch_candidate_items(page, font_key)
-    glyph_map = build_age_glyph_map(page, [str(item.get("age", "")) for item in items])
+    api_error = ""
+    items: list[dict[str, object]] = []
+    try:
+        items = fetch_candidate_items(page, font_key)
+    except Exception as exc:
+        api_error = str(exc)
+    glyph_map = build_age_glyph_map(page, [str(item.get("age", "")) for item in items], font_key=font_key) if items else {}
 
+    api_candidates = [normalize_candidate_from_api(item, glyph_map) for item in items]
+    api_by_infoid = {str(item["infoid"]): item for item in api_candidates if item.get("infoid")}
+    api_by_name = {str(item["name"]): item for item in api_candidates if item.get("name")}
+
+    page_candidates = build_page_candidates(page, glyph_map)
     matches: list[dict[str, object]] = []
+    skipped_reasons: list[str] = []
     skipped_unknown_age: list[str] = []
-    for item in items:
-        sex = str(item.get("sex", "")).strip()
-        age = decode_age(str(item.get("age", "")), glyph_map)
-        if age is None:
-            skipped_unknown_age.append(str(item.get("name", "")))
-            continue
-        if sex != "男":
-            continue
-        if not (18 <= age <= 55):
-            continue
-        if int(item.get("chatState", -1)) != 0:
-            continue
-        matches.append(
-            {
-                "name": str(item.get("name", "")),
-                "age": age,
-                "infoid": str(item.get("infoId", "")),
-            }
-        )
+    for page_candidate in page_candidates:
+        api_candidate = None
+        if page_candidate.get("infoid"):
+            api_candidate = api_by_infoid.get(str(page_candidate["infoid"]))
+        if api_candidate is None and page_candidate.get("name"):
+            api_candidate = api_by_name.get(str(page_candidate["name"]))
+        merged = merge_candidate(page_candidate, api_candidate)
+        ok, reason = is_target_candidate(merged)
+        if ok:
+            matches.append(merged)
+        else:
+            label = normalize_text(merged.get("name", "")) or f"第{int(merged.get('index', 0)) + 1}行"
+            age = merged.get("age")
+            age_text = str(age) if isinstance(age, int) else "年龄未知"
+            label = f"{label}({age_text})"
+            if reason == "年龄无法识别":
+                skipped_unknown_age.append(label)
+            else:
+                skipped_reasons.append(f"{label} - {reason}")
 
     clicked: list[str] = []
     skipped_not_online: list[str] = []
     for match in matches:
         close_known_dialogs(page)
-        row, button = find_target_row(page, str(match["name"]), int(match["age"]), glyph_map)
+        row, button = find_target_row(page, match, glyph_map)
         if row is None or button is None:
             skipped_not_online.append(f"{match['name']}({match['age']}) - 页面未找到")
             continue
         success = False
         last_button_text = ""
+        failure_reason = ""
         for _ in range(3):
             button.scroll_into_view_if_needed()
-            last_button_text = button.inner_text().strip()
-            if last_button_text != ONLINE_CHAT_TEXT:
+            last_button_text = normalize_text(button.inner_text())
+            if not is_actionable_chat_text(last_button_text):
                 break
             try:
                 button.click(timeout=5000)
@@ -621,30 +986,45 @@ def click_matching_online_chat(page) -> None:
                     page.wait_for_timeout(500)
                     continue
             page.wait_for_timeout(1200)
-            popup_success = has_chat_popup(page)
-            popup_closed = close_known_dialogs(page)
+            feedback_texts = read_visible_feedback_texts(page)
+            feedback_result = classify_feedback_texts(feedback_texts)
             try:
-                updated_text = button.inner_text().strip()
+                updated_text = normalize_text(button.inner_text())
             except Exception:
                 updated_text = ""
-            if updated_text != ONLINE_CHAT_TEXT:
+            if updated_text and updated_text != last_button_text and not is_actionable_chat_text(updated_text):
                 last_button_text = updated_text
                 success = True
                 break
-            if popup_success or popup_closed:
-                last_button_text = "弹框已处理"
+            if is_success_chat_text(updated_text):
+                last_button_text = updated_text
                 success = True
                 break
+            if feedback_result == "success":
+                last_button_text = "弹框提示成功"
+                success = True
+                close_known_dialogs(page)
+                break
+            if feedback_result == "failure":
+                failure_reason = " / ".join(feedback_texts)
+                close_known_dialogs(page)
+                break
+            close_known_dialogs(page)
         if success:
             clicked.append(f"{match['name']}({match['age']})")
         else:
+            final_reason = failure_reason or f"最终按钮是{last_button_text or '未识别'}"
             skipped_not_online.append(
-                f"{match['name']}({match['age']}) - 最终按钮是{last_button_text or '未识别'}"
+                f"{match['name']}({match['age']}) - {final_reason}"
             )
 
     print("筛选结果：")
-    print(f"字体 key：{font_key}")
+    print(f"字体 key：{font_key or '未获取'}")
     print(f"年龄解码映射：{glyph_map}")
+    print(f"页面候选行数：{len(page_candidates)}")
+    print(f"接口候选数：{len(api_candidates)}")
+    if api_error:
+        print(f"接口诊断：{api_error}")
     print(f"命中人数：{len(matches)}")
     if clicked:
         print("已点击在线沟通：")
@@ -658,11 +1038,15 @@ def click_matching_online_chat(page) -> None:
         print("年龄无法解码，已跳过：")
         for item in skipped_unknown_age:
             print(f"- {item}")
+    if skipped_reasons:
+        print("未命中原因：")
+        for item in skipped_reasons:
+            print(f"- {item}")
 
 
-def run_once(page, login_timeout_seconds: float | None = None) -> None:
+def run_once(context, page, login_timeout_seconds: float | None = None):
     page.goto(TARGET_URL, wait_until="domcontentloaded")
-    wait_for_login(page, timeout_seconds=login_timeout_seconds)
+    page = wait_for_login(context, page, timeout_seconds=login_timeout_seconds)
     if TARGET_URL not in page.url:
         print("登录完成，正在进入人才管理页。")
         page.goto(TARGET_URL, wait_until="domcontentloaded")
@@ -670,6 +1054,7 @@ def run_once(page, login_timeout_seconds: float | None = None) -> None:
     wait_for_candidate_list(page)
     page.bring_to_front()
     click_matching_online_chat(page)
+    return page
 
 
 def run_periodically(context, page, run_duration_seconds: float | None) -> None:
@@ -682,7 +1067,7 @@ def run_periodically(context, page, run_duration_seconds: float | None) -> None:
 
         remaining_seconds = None if deadline is None else max(0, deadline - time.time())
         try:
-            run_once(page, login_timeout_seconds=remaining_seconds)
+            page = run_once(context, page, login_timeout_seconds=remaining_seconds)
         except Exception as exc:
             print(f"第 {cycle} 轮执行失败：{exc}")
         if deadline is None:
