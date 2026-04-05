@@ -44,6 +44,53 @@ def get_edge_user_data_dir() -> Path:
     return base_dir / "edge_profile"
 
 
+def get_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def get_shortcut_path() -> Path:
+    if getattr(sys, "frozen", False):
+        exe_path = Path(sys.executable).resolve()
+        return exe_path.parent / f"{exe_path.stem}_独立数据目录.lnk"
+    script_path = Path(__file__).resolve()
+    return script_path.parent / f"{script_path.stem}_独立数据目录.lnk"
+
+
+def ensure_local_shortcut() -> None:
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+
+    shortcut_path = get_shortcut_path()
+    if shortcut_path.exists():
+        return
+
+    edge_path = find_edge_path()
+    base_dir = get_base_dir()
+    user_data_dir = get_edge_user_data_dir()
+    arguments = f'--user-data-dir="{user_data_dir}" --profile-directory={EDGE_PROFILE_DIRECTORY}'
+    script = rf"""
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut('{str(shortcut_path).replace("'", "''")}')
+$Shortcut.TargetPath = '{str(edge_path).replace("'", "''")}'
+$Shortcut.Arguments = '{arguments.replace("'", "''")}'
+$Shortcut.WorkingDirectory = '{str(base_dir).replace("'", "''")}'
+$Shortcut.Description = '58专用 Edge（独立数据目录：{str(user_data_dir).replace("'", "''")}）'
+$Shortcut.Save()
+"""
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        print(f"已创建快捷方式：{shortcut_path}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"创建快捷方式失败，已跳过：{exc}")
+
+
 def build_version_endpoint(cdp_port: int) -> str:
     return f"http://{CDP_HOST}:{cdp_port}/json/version"
 
@@ -699,6 +746,7 @@ def open_58_with_cdp() -> None:
 
 def main() -> int:
     try:
+        ensure_local_shortcut()
         open_58_with_cdp()
         return 0
     except Exception as exc:
