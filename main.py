@@ -561,6 +561,28 @@ def get_age_font_family(page) -> str | None:
     return font_family or None
 
 
+def wait_for_age_render_ready(page, timeout_ms: int = 2500) -> None:
+    script = r"""
+() => {
+  const selectors = ['.list-info-age', '[class*="age"]'];
+  for (const selector of selectors) {
+    const elements = Array.from(document.querySelectorAll(selector));
+    for (const element of elements) {
+      const text = (element.innerText || element.textContent || '').trim();
+      if (!text || !text.includes('岁')) continue;
+      const style = getComputedStyle(element);
+      if ((style.fontFamily || '').trim()) return true;
+    }
+  }
+  return false;
+}
+"""
+    try:
+        page.wait_for_function(script, timeout=timeout_ms)
+    except Exception:
+        pass
+
+
 def build_paychat_api_url(font_key: str | None) -> str:
     params = [
         "jslState=0",
@@ -607,16 +629,7 @@ def fetch_candidate_items(page, font_key: str | None) -> list[dict[str, object]]
     return items
 
 
-def build_age_glyph_map(page, age_values: list[str], font_key: str | None = None) -> dict[str, str]:
-    glyphs: list[str] = []
-    for age_value in age_values:
-        decoded = unescape(age_value)
-        for ch in decoded:
-            if ch.isdigit() or ch == "岁" or ch.isspace():
-                continue
-            if ch not in glyphs:
-                glyphs.append(ch)
-
+def _build_age_glyph_map_once(page, glyphs: list[str], font_key: str | None = None) -> dict[str, str]:
     if not glyphs:
         return {}
 
@@ -688,6 +701,29 @@ def build_age_glyph_map(page, age_values: list[str], font_key: str | None = None
     merged_mapping.update(normalized_mapping)
     AGE_GLYPH_MAP_CACHE[cache_key] = merged_mapping
     return {glyph: merged_mapping[glyph] for glyph in glyphs if glyph in merged_mapping}
+
+
+def build_age_glyph_map(page, age_values: list[str], font_key: str | None = None) -> dict[str, str]:
+    glyphs: list[str] = []
+    for age_value in age_values:
+        decoded = unescape(age_value)
+        for ch in decoded:
+            if ch.isdigit() or ch == "岁" or ch.isspace():
+                continue
+            if ch not in glyphs:
+                glyphs.append(ch)
+
+    if not glyphs:
+        return {}
+
+    wait_for_age_render_ready(page)
+    for attempt in range(3):
+        mapping = _build_age_glyph_map_once(page, glyphs, font_key=font_key)
+        if mapping:
+            return mapping
+        if attempt < 2:
+            page.wait_for_timeout(800)
+    return {}
 
 
 def decode_age(age_value: str, glyph_map: dict[str, str]) -> int | None:
@@ -886,10 +922,6 @@ def is_target_candidate(candidate: dict[str, object]) -> tuple[bool, str]:
         return False, "年龄无法识别"
     if not (18 <= age <= 55):
         return False, f"年龄不在范围内：{age}"
-
-    chat_state = candidate.get("api_chat_state")
-    if isinstance(chat_state, int) and chat_state not in (0,):
-        return False, f"接口 chatState 不可点击：{chat_state}"
     return True, ""
 
 
