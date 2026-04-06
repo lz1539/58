@@ -1309,20 +1309,6 @@ def open_58_with_cdp() -> None:
         except Exception as exc:
             raise RuntimeError(f"CDP 连接失败（{CDP_HOST}:{cdp_port}）：{exc}") from exc
         context = browser.contexts[0] if browser.contexts else browser.new_context()
-        
-        # 拦截极速聊等自动弹出的新页面
-        def handle_popup(new_page):
-            try:
-                new_page.wait_for_load_state("domcontentloaded", timeout=5000)
-                url = new_page.url.lower()
-                title = new_page.title().lower()
-                # 排除规则：URL 或 标题包含黑名单关键词，且不是我们要的任务页
-                if any(kw in url or kw in title for kw in ("speed", "talent", "pay", "极速", "人才", "权益")):
-                    print(f"拦截到非目标弹出页，已关闭：{url}")
-                    new_page.close()
-            except Exception:
-                pass
-        context.on("page", handle_popup)
 
         page = context.pages[0] if context.pages else context.new_page()
         if run_duration_seconds is None:
