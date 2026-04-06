@@ -20,8 +20,10 @@ TARGET_URL = "https://employer.58.com/main/jobmanage"
 EDGE_PROFILE_DIRECTORY = "Default"
 LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
 ONLINE_CHAT_TEXT_CANDIDATES = ("在线沟通", "立即沟通", "马上沟通", "发起沟通")
+CHAT_EXCLUDE_KEYWORDS = ("极速", "人才", "特权", "优先", "简历", "下载", "电话", "权益", "购买", "简历包", "推荐", "会员", "开通", "体验")
 CHAT_SUCCESS_TEXT_CANDIDATES = ("继续沟通", "立即回复", "去沟通", "已沟通")
 CHAT_FAILURE_KEYWORDS = ("开通", "购买", "受限", "上限", "失败", "异常", "不可", "暂停", "稍后", "请先登录")
+FORBIDDEN_ATTRS = ("talent", "priority", "speed", "recommend", "gift", "vip", "privilege", "extreme", "fast", "pay", "member", "bait")
 ROW_SELECTORS = (
     ".interested-list",
     "[class*='resume'][class*='list'] [class*='item']",
@@ -397,7 +399,11 @@ def normalize_sex(value: object) -> str | None:
 
 def is_actionable_chat_text(text: object) -> bool:
     normalized = normalize_text(text)
-    return bool(normalized) and any(keyword in normalized for keyword in ONLINE_CHAT_TEXT_CANDIDATES)
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in CHAT_EXCLUDE_KEYWORDS):
+        return False
+    return any(keyword in normalized for keyword in ONLINE_CHAT_TEXT_CANDIDATES)
 
 
 def is_success_chat_text(text: object) -> bool:
@@ -443,100 +449,59 @@ def wait_for_candidate_list(page, timeout_seconds: float = 20) -> None:
 
 def close_known_dialogs(page) -> bool:
     closed_any = False
+    # 仅保留具有明确“关闭”标识的选择器
     selectors = [
-        ".coupon-dialog .el-dialog__headerbtn",
         ".el-dialog__headerbtn",
         ".el-message-box__close",
         ".el-drawer__close-btn",
-        ".chat-dialog .close",
         ".el-notification__closeBtn",
         ".el-message__closeBtn",
         ".el-popover__close",
-        ".hx-capsule-wrapper [class*='close']",
-        ".hx-capsule-wrapper [aria-label*='关闭']",
-        ".hx-capsule-wrapper [title*='关闭']",
-        "[class*='capsule'] [class*='close']",
-        "[class*='chat'] [class*='close']",
-        "[class*='im'] [class*='close']",
-        "[class*='dialog'] [class*='close']",
-        "[class*='popup'] [class*='close']",
+        "i[class*='close']",
+        "button[aria-label*='关闭']",
+        "button[title*='关闭']",
     ]
     for selector in selectors:
         locator = page.locator(selector)
-        count = min(locator.count(), 3)
-        for index in range(count):
+        for i in range(min(locator.count(), 3)):
             try:
-                button = locator.nth(index)
-                if not button.is_visible():
-                    continue
-                button.click(timeout=1000)
-                page.wait_for_timeout(300)
-                closed_any = True
-            except Exception:
-                continue
-    if closed_any:
-        return True
-
+                btn = locator.nth(i)
+                if btn.is_visible():
+                    btn.click(timeout=500)
+                    closed_any = True
+            except Exception: continue
+    
+    # 严格的 JS 过滤：必须包含“关闭”文字或类名
     script = r"""
 () => {
-  const roots = Array.from(document.querySelectorAll('.hx-capsule-wrapper, [class*="capsule"], [class*="chat"], [class*="im"]'));
-  const isVisible = (element) => {
-    if (!element) return false;
-    const style = window.getComputedStyle(element);
-    if (!style) return false;
-    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
-      return false;
-    }
-    if (Number(style.opacity || '1') === 0) {
-      return false;
-    }
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+  const isVisible = (el) => {
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.getBoundingClientRect().width > 0;
   };
-  const visibleRoots = roots.filter(isVisible);
-  for (const root of visibleRoots) {
-    const rootRect = root.getBoundingClientRect();
-    const candidates = Array.from(root.querySelectorAll('button, a, i, span, [role="button"]'))
-      .filter(isVisible)
-      .map((element) => {
-        const rect = element.getBoundingClientRect();
-        const text = (element.innerText || element.textContent || '').trim();
-        const normalizedText = text.toLowerCase();
-        const className = typeof element.className === 'string' ? element.className : '';
-        const title = element.getAttribute('title') || '';
-        const ariaLabel = element.getAttribute('aria-label') || '';
-        let score = 0;
-        if (/关闭|close|cancel/i.test(text) || /关闭|close|cancel/i.test(title) || /关闭|close|cancel/i.test(ariaLabel)) {
-          score += 100;
-        }
-        if (/close|cancel/i.test(className)) {
-          score += 60;
-        }
-        if (text === '×' || normalizedText === 'x') {
-          score += 40;
-        }
-        if (rect.width <= 40 && rect.height <= 40) {
-          score += 20;
-        }
-        score += Math.max(0, 50 - Math.abs(rootRect.right - rect.right));
-        score += Math.max(0, 50 - Math.abs(rootRect.top - rect.top));
-        return { element, score };
-      })
-      .sort((a, b) => b.score - a.score);
-    if (candidates.length > 0 && candidates[0].score > 40) {
-      candidates[0].element.click();
-      return true;
+  const candidates = Array.from(document.querySelectorAll('button, a, i, span'))
+    .filter(isVisible)
+    .filter(el => {
+      const text = (el.innerText || el.textContent || '').trim();
+      const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+      const title = (el.getAttribute('title') || '').toLowerCase();
+      // 必须明确包含关闭关键词
+      return /关闭|取消|退出|确认|知道了|^×$|^x$/i.test(text) || /close|cancel|confirm/i.test(cls) || /close|cancel/i.test(title);
+    });
+  
+  if (candidates.length > 0) {
+    // 限制在弹窗或浮层内，防止误触列表
+    const popup = document.querySelector('.el-dialog__wrapper, .el-message-box__wrapper, .el-drawer__wrapper, [role="dialog"], [role="alert"]');
+    if (popup) {
+      const btn = candidates.find(c => popup.contains(c));
+      if (btn) { btn.click(); return true; }
     }
   }
   return false;
 }
 """
     try:
-        if page.evaluate(script):
-            page.wait_for_timeout(300)
-            return True
-    except Exception:
-        pass
+        if page.evaluate(script): closed_any = True
+    except Exception: pass
     return closed_any
 
 
@@ -919,6 +884,22 @@ def extract_row_snapshot(row, glyph_map: dict[str, str]) -> dict[str, object]:
     age_text = normalize_text(snapshot.get("ageText", ""))
     sex_text = normalize_text(snapshot.get("sexText", ""))
     button_texts = [normalize_text(text) for text in snapshot.get("buttonTexts", []) if normalize_text(text)]
+    selected_button_text = ""
+    # 优先寻找精准匹配
+    for text in button_texts:
+        if text == "在线沟通":
+            selected_button_text = text
+            break
+    # 其次寻找模糊匹配但排除干扰
+    if not selected_button_text:
+        for text in button_texts:
+            if is_actionable_chat_text(text):
+                selected_button_text = text
+                break
+    # 最后兜底
+    if not selected_button_text:
+        selected_button_text = next((text for text in button_texts if "沟通" in text and not any(kw in text for kw in CHAT_EXCLUDE_KEYWORDS)), button_texts[0] if button_texts else "")
+
     combined_hint_text = " ".join([normalize_text(snapshot.get("html", ""))] + [normalize_text(value) for value in snapshot.get("hints", [])])
     infoid_match = re.search(r"(?i)(?:infoid|resumeid|data-infoid|data-id)[^0-9]{0,8}(\d{5,})", combined_hint_text)
     return {
@@ -927,7 +908,7 @@ def extract_row_snapshot(row, glyph_map: dict[str, str]) -> dict[str, object]:
         "sex": normalize_sex(sex_text or full_text),
         "age": infer_age_from_text(age_text or full_text, glyph_map),
         "button_texts": button_texts,
-        "button_text": next((text for text in button_texts if "沟通" in text), button_texts[0] if button_texts else ""),
+        "button_text": selected_button_text,
         "text": full_text,
         "infoid": normalize_text(snapshot.get("infoId", "")) or (infoid_match.group(1) if infoid_match else ""),
         "resumeid": normalize_text(snapshot.get("resumeId", "")),
@@ -1006,36 +987,60 @@ def is_target_candidate(candidate: dict[str, object]) -> tuple[bool, str]:
 
 
 def find_real_chat_button(row):
+    # 干扰项类名/属性黑名单
+    FORBIDDEN_ATTRS = ("talent", "priority", "speed", "recommend", "gift", "vip", "privilege", "extreme", "fast", "pay")
+    
+    # 候选选择器
     selectors = [
         "button.list-chat-btn, a.list-chat-btn",
         "button[class*='chat-btn'], a[class*='chat-btn']",
+        "button.el-button--primary",
+        "button, a",
     ]
+    
+    def is_valid_button(btn):
+        try:
+            if not btn.is_visible(): return False
+            # 获取完整 HTML 进行深层检查
+            html = btn.evaluate("el => el.outerHTML").lower()
+            if any(kw in html for kw in CHAT_EXCLUDE_KEYWORDS): return False
+            if any(kw in html for kw in FORBIDDEN_ATTRS): return False
+            
+            text = normalize_text(btn.inner_text())
+            if any(kw in text for kw in CHAT_EXCLUDE_KEYWORDS): return False
+            
+            aria_disabled = normalize_text(btn.get_attribute("aria-disabled") or "")
+            if aria_disabled in {"true", "1"} or btn.get_attribute("disabled") is not None: return False
+            return True
+        except Exception: return False
+
+    # 优先级 1: 精准文本匹配且合法
     for selector in selectors:
         buttons = row.locator(selector)
-        total = buttons.count()
+        for i in range(buttons.count()):
+            btn = buttons.nth(i)
+            if is_valid_button(btn) and normalize_text(btn.inner_text()) == "在线沟通":
+                return btn
+
+    # 优先级 2: 候选名单匹配且合法
+    for selector in selectors:
+        buttons = row.locator(selector)
         actionable_button = None
         success_button = None
-        for index in range(total):
-            button = buttons.nth(index)
-            try:
-                if not button.is_visible():
-                    continue
-                text = normalize_text(button.inner_text())
-                aria_disabled = normalize_text(button.get_attribute("aria-disabled") or "")
-                disabled_attr = button.get_attribute("disabled")
-            except Exception:
-                continue
-            if aria_disabled in {"true", "1"} or disabled_attr is not None:
-                continue
+        for i in range(buttons.count()):
+            btn = buttons.nth(i)
+            if not is_valid_button(btn): continue
+            
+            text = normalize_text(btn.inner_text())
             if text in ONLINE_CHAT_TEXT_CANDIDATES:
-                actionable_button = button
+                actionable_button = btn
                 break
             if success_button is None and text in CHAT_SUCCESS_TEXT_CANDIDATES:
-                success_button = button
-        if actionable_button is not None:
-            return actionable_button
-        if success_button is not None:
-            return success_button
+                success_button = btn
+        
+        if actionable_button is not None: return actionable_button
+        if success_button is not None: return success_button
+        
     return None
 
 
@@ -1160,7 +1165,9 @@ def click_matching_online_chat(page) -> None:
                     failure_reason = "目标按钮被遮挡"
                     break
             last_button_text = normalize_text(button.inner_text())
-            print(f"点击前按钮文本：{match['name']}({match['age']}) - {last_button_text or '空'}")
+            button_html = button.evaluate("el => el.outerHTML")
+            print(f"诊断：准备点击按钮 - 候选人: {match['name']} | 文本: {last_button_text} | HTML: {button_html}")
+            
             if is_success_chat_text(last_button_text):
                 success = True
                 break
@@ -1302,6 +1309,21 @@ def open_58_with_cdp() -> None:
         except Exception as exc:
             raise RuntimeError(f"CDP 连接失败（{CDP_HOST}:{cdp_port}）：{exc}") from exc
         context = browser.contexts[0] if browser.contexts else browser.new_context()
+        
+        # 拦截极速聊等自动弹出的新页面
+        def handle_popup(new_page):
+            try:
+                new_page.wait_for_load_state("domcontentloaded", timeout=5000)
+                url = new_page.url.lower()
+                title = new_page.title().lower()
+                # 排除规则：URL 或 标题包含黑名单关键词，且不是我们要的任务页
+                if any(kw in url or kw in title for kw in ("speed", "talent", "pay", "极速", "人才", "权益")):
+                    print(f"拦截到非目标弹出页，已关闭：{url}")
+                    new_page.close()
+            except Exception:
+                pass
+        context.on("page", handle_popup)
+
         page = context.pages[0] if context.pages else context.new_page()
         if run_duration_seconds is None:
             print("本次计划永久执行。")
