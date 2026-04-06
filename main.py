@@ -481,6 +481,12 @@ def close_known_dialogs(page) -> bool:
         ".el-notification__closeBtn",
         ".el-message__closeBtn",
         ".el-popover__close",
+        ".hx-capsule-wrapper [class*='close']",
+        ".hx-capsule-wrapper [aria-label*='关闭']",
+        ".hx-capsule-wrapper [title*='关闭']",
+        "[class*='capsule'] [class*='close']",
+        "[class*='chat'] [class*='close']",
+        "[class*='im'] [class*='close']",
         "[class*='dialog'] [class*='close']",
         "[class*='popup'] [class*='close']",
     ]
@@ -497,6 +503,69 @@ def close_known_dialogs(page) -> bool:
                 closed_any = True
             except Exception:
                 continue
+    if closed_any:
+        return True
+
+    script = r"""
+() => {
+  const roots = Array.from(document.querySelectorAll('.hx-capsule-wrapper, [class*="capsule"], [class*="chat"], [class*="im"]'));
+  const isVisible = (element) => {
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    if (!style) return false;
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+      return false;
+    }
+    if (Number(style.opacity || '1') === 0) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const visibleRoots = roots.filter(isVisible);
+  for (const root of visibleRoots) {
+    const rootRect = root.getBoundingClientRect();
+    const candidates = Array.from(root.querySelectorAll('button, a, i, span, [role="button"]'))
+      .filter(isVisible)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const text = (element.innerText || element.textContent || '').trim();
+        const normalizedText = text.toLowerCase();
+        const className = typeof element.className === 'string' ? element.className : '';
+        const title = element.getAttribute('title') || '';
+        const ariaLabel = element.getAttribute('aria-label') || '';
+        let score = 0;
+        if (/关闭|close|cancel/i.test(text) || /关闭|close|cancel/i.test(title) || /关闭|close|cancel/i.test(ariaLabel)) {
+          score += 100;
+        }
+        if (/close|cancel/i.test(className)) {
+          score += 60;
+        }
+        if (text === '×' || normalizedText === 'x') {
+          score += 40;
+        }
+        if (rect.width <= 40 && rect.height <= 40) {
+          score += 20;
+        }
+        score += Math.max(0, 50 - Math.abs(rootRect.right - rect.right));
+        score += Math.max(0, 50 - Math.abs(rootRect.top - rect.top));
+        return { element, score };
+      })
+      .sort((a, b) => b.score - a.score);
+    if (candidates.length > 0 && candidates[0].score > 40) {
+      candidates[0].element.click();
+      return true;
+    }
+  }
+  return false;
+}
+"""
+    try:
+        if page.evaluate(script):
+            page.wait_for_timeout(300)
+            return True
+    except Exception:
+        pass
     return closed_any
 
 
