@@ -346,27 +346,6 @@ def is_login_page(url: str) -> bool:
     return any(keyword in normalized for keyword in LOGIN_URL_KEYWORDS)
 
 
-def pick_active_page(context, fallback_page=None):
-    pages = [page for page in context.pages if not page.is_closed()]
-    if fallback_page is not None and not fallback_page.is_closed():
-        pages.insert(0, fallback_page)
-
-    unique_pages = list(dict.fromkeys(pages))
-    if not unique_pages:
-        return fallback_page if fallback_page is not None else context.new_page()
-
-    for page in unique_pages:
-        if TARGET_URL in page.url:
-            return page
-    for page in unique_pages:
-        if page.url.startswith("http") and not is_login_page(page.url):
-            return page
-    for page in unique_pages:
-        if page.url.startswith("http"):
-            return page
-    return unique_pages[0]
-
-
 def wait_for_login(context, page, timeout_seconds: float | None = 600):
     if not is_login_page(page.url):
         return page
@@ -379,10 +358,13 @@ def wait_for_login(context, page, timeout_seconds: float | None = 600):
             page.wait_for_load_state("domcontentloaded", timeout=1000)
         except Exception:
             pass
-        active_page = pick_active_page(context, fallback_page=page)
-        if not is_login_page(active_page.url):
-            print(f"检测到已离开登录页：{active_page.url}")
-            return active_page
+        if page.is_closed():
+            pages = [item for item in context.pages if not item.is_closed()]
+            if pages:
+                page = pages[0]
+        if not page.is_closed() and not is_login_page(page.url):
+            print(f"检测到已离开登录页：{page.url}")
+            return page
         time.sleep(1)
     raise TimeoutError("等待用户登录超时，请重新运行程序后再试。")
 
@@ -1024,40 +1006,37 @@ def is_target_candidate(candidate: dict[str, object]) -> tuple[bool, str]:
 
 
 def find_real_chat_button(row):
-    buttons = row.locator("button, a, [role='button']")
-    total = buttons.count()
-    best_button = None
-    best_score = -1
-    for index in range(total):
-        button = buttons.nth(index)
-        try:
-            if not button.is_visible():
+    selectors = [
+        "button.list-chat-btn, a.list-chat-btn",
+        "button[class*='chat-btn'], a[class*='chat-btn']",
+    ]
+    for selector in selectors:
+        buttons = row.locator(selector)
+        total = buttons.count()
+        actionable_button = None
+        success_button = None
+        for index in range(total):
+            button = buttons.nth(index)
+            try:
+                if not button.is_visible():
+                    continue
+                text = normalize_text(button.inner_text())
+                aria_disabled = normalize_text(button.get_attribute("aria-disabled") or "")
+                disabled_attr = button.get_attribute("disabled")
+            except Exception:
                 continue
-            text = normalize_text(button.inner_text())
-            class_name = normalize_text(button.get_attribute("class") or "")
-            aria_disabled = normalize_text(button.get_attribute("aria-disabled") or "")
-            disabled_attr = button.get_attribute("disabled")
-        except Exception:
-            continue
-        if not text or "沟通" not in text:
-            continue
-        score = 0
-        if is_actionable_chat_text(text):
-            score += 100
-        elif is_success_chat_text(text):
-            score += 10
-        if "list-chat-btn" in class_name:
-            score += 20
-        if "chat-btn" in class_name:
-            score += 10
-        if aria_disabled not in {"true", "1"} and disabled_attr is None:
-            score += 5
-        if text in ONLINE_CHAT_TEXT_CANDIDATES:
-            score += 3
-        if score > best_score:
-            best_button = button
-            best_score = score
-    return best_button
+            if aria_disabled in {"true", "1"} or disabled_attr is not None:
+                continue
+            if text in ONLINE_CHAT_TEXT_CANDIDATES:
+                actionable_button = button
+                break
+            if success_button is None and text in CHAT_SUCCESS_TEXT_CANDIDATES:
+                success_button = button
+        if actionable_button is not None:
+            return actionable_button
+        if success_button is not None:
+            return success_button
+    return None
 
 
 def is_button_click_target_clear(page, button) -> bool:
