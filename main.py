@@ -598,12 +598,12 @@ def wait_for_age_render_ready(page, timeout_ms: int = 2500) -> None:
         pass
 
 
-def build_paychat_api_url(font_key: str | None) -> str:
+def build_paychat_api_url(font_key: str | None, page_num: int = 1) -> str:
     params = [
         "jslState=0",
         "infoId=0",
         "imSource=-1",
-        "page=1",
+        f"page={page_num}",
         "pageSize=10",
         "chatState=0",
         "from=pc,hx_manage_interestedlist,other",
@@ -617,8 +617,8 @@ def build_paychat_api_url(font_key: str | None) -> str:
     return "https://zpim.58.com/resumepaychat/paychatlist?" + "&".join(params)
 
 
-def fetch_candidate_items(page, font_key: str | None) -> list[dict[str, object]]:
-    api_url = build_paychat_api_url(font_key)
+def fetch_candidate_items(page, font_key: str | None, page_num: int = 1) -> list[dict[str, object]]:
+    api_url = build_paychat_api_url(font_key, page_num=page_num)
     script = """
     async (url) => {
       const resp = await fetch(url, { credentials: 'include' });
@@ -1090,13 +1090,13 @@ def find_target_row(page, target: dict[str, object], glyph_map: dict[str, str]):
     return None, None
 
 
-def click_matching_online_chat(page) -> None:
+def click_matching_online_chat(page, page_num: int = 1) -> None:
     close_known_dialogs(page)
     font_key = get_font_key(page)
     api_error = ""
     items: list[dict[str, object]] = []
     try:
-        items = fetch_candidate_items(page, font_key)
+        items = fetch_candidate_items(page, font_key, page_num=page_num)
     except Exception as exc:
         api_error = str(exc)
     glyph_map = build_age_glyph_map(page, [str(item.get("age", "")) for item in items], font_key=font_key) if items else {}
@@ -1240,6 +1240,57 @@ def click_matching_online_chat(page) -> None:
             print(f"- {item}")
 
 
+def go_to_page_ui(page, page_num: int) -> bool:
+    if page_num == 1:
+        return True
+    
+    # 尝试寻找分页按钮
+    selectors = [
+        f"ul.el-pagination li.number:text('{page_num}')",
+        f".el-pagination button:text('{page_num}')",
+        f"button:text('{page_num}')",
+        f"a:text('{page_num}')",
+        f"li:text('{page_num}')",
+    ]
+    
+    for selector in selectors:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible():
+                btn.scroll_into_view_if_needed()
+                btn.click()
+                print(f"UI 切换至第 {page_num} 页成功。")
+                page.wait_for_timeout(2000)
+                wait_for_candidate_list(page)
+                return True
+        except Exception:
+            continue
+            
+    # 如果找不到数字按钮，尝试点击“下一页”
+    if page_num > 1:
+        next_selectors = [
+            "button.btn-next",
+            "li.btn-next",
+            "button:has-text('下一页')",
+            "a:has-text('下一页')",
+        ]
+        for selector in next_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible():
+                    btn.scroll_into_view_if_needed()
+                    btn.click()
+                    print(f"UI 点击“下一页”成功。")
+                    page.wait_for_timeout(2000)
+                    wait_for_candidate_list(page)
+                    return True
+            except Exception:
+                continue
+    
+    print(f"未能切换到第 {page_num} 页。")
+    return False
+
+
 def run_once(context, page, login_timeout_seconds: float | None = None):
     page.goto(TARGET_URL, wait_until="domcontentloaded")
     page = wait_for_login(context, page, timeout_seconds=login_timeout_seconds)
@@ -1249,7 +1300,16 @@ def run_once(context, page, login_timeout_seconds: float | None = None):
     page.wait_for_load_state("domcontentloaded")
     wait_for_candidate_list(page)
     page.bring_to_front()
-    click_matching_online_chat(page)
+    
+    print("--- 正在处理第 1 页 ---")
+    click_matching_online_chat(page, page_num=1)
+    
+    # 处理第 2 页
+    print("\n--- 正在尝试切换至第 2 页 ---")
+    if go_to_page_ui(page, page_num=2):
+        print("--- 正在处理第 2 页 ---")
+        click_matching_online_chat(page, page_num=2)
+    
     return page
 
 
