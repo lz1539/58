@@ -374,7 +374,6 @@ def wait_for_login(context, page, timeout_seconds: float | None = 600):
     print(f"当前位于登录页：{page.url}")
     print("请在 Edge 窗口中完成登录，程序会在登录成功后继续。")
     deadline = None if timeout_seconds is None else time.time() + timeout_seconds
-    last_probe_time = 0.0
     while deadline is None or time.time() < deadline:
         try:
             page.wait_for_load_state("domcontentloaded", timeout=1000)
@@ -384,16 +383,6 @@ def wait_for_login(context, page, timeout_seconds: float | None = 600):
         if not is_login_page(active_page.url):
             print(f"检测到已离开登录页：{active_page.url}")
             return active_page
-        now = time.time()
-        if now - last_probe_time >= 3:
-            last_probe_time = now
-            try:
-                active_page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
-            except Exception:
-                pass
-            if not is_login_page(active_page.url):
-                print(f"检测到登录态已生效，已进入人才管理页：{active_page.url}")
-                return active_page
         time.sleep(1)
     raise TimeoutError("等待用户登录超时，请重新运行程序后再试。")
 
@@ -1071,6 +1060,28 @@ def find_real_chat_button(row):
     return best_button
 
 
+def is_button_click_target_clear(page, button) -> bool:
+    try:
+        box = button.bounding_box()
+    except Exception:
+        return False
+    if not box:
+        return False
+    x = box["x"] + box["width"] / 2
+    y = box["y"] + box["height"] / 2
+    script = r"""
+([element, x, y]) => {
+  const target = document.elementFromPoint(x, y);
+  if (!target) return false;
+  return target === element || element.contains(target) || target.contains(element);
+}
+"""
+    try:
+        return bool(page.evaluate(script, [button.element_handle(), x, y]))
+    except Exception:
+        return False
+
+
 def find_target_row(page, target: dict[str, object], glyph_map: dict[str, str]):
     for row in iter_candidate_rows(page):
         try:
@@ -1155,6 +1166,20 @@ def click_matching_online_chat(page) -> None:
         failure_reason = ""
         for _ in range(3):
             button.scroll_into_view_if_needed()
+            if not is_button_click_target_clear(page, button):
+                close_known_dialogs(page)
+                page.wait_for_timeout(300)
+                try:
+                    button = find_real_chat_button(row)
+                except Exception:
+                    button = None
+                if button is None:
+                    failure_reason = "目标按钮被遮挡"
+                    break
+                button.scroll_into_view_if_needed()
+                if not is_button_click_target_clear(page, button):
+                    failure_reason = "目标按钮被遮挡"
+                    break
             last_button_text = normalize_text(button.inner_text())
             print(f"点击前按钮文本：{match['name']}({match['age']}) - {last_button_text or '空'}")
             if is_success_chat_text(last_button_text):
