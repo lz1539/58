@@ -40,6 +40,13 @@ ROW_FALLBACK_SELECTORS = (
 REFRESH_INTERVAL_SECONDS = 600
 DEFAULT_RUN_HOURS = 1
 AGE_GLYPH_MAP_CACHE: dict[str, dict[str, str]] = {}
+SESSION_CLOSED_ERROR_KEYWORDS = (
+    "target page, context or browser has been closed",
+    "browsercontext.new_page",
+    "browser has been closed",
+    "connection closed",
+    "browser.disconnected",
+)
 
 
 def find_edge_path() -> Path:
@@ -67,6 +74,49 @@ def get_base_dir() -> Path:
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
+
+def get_runtime_state_file() -> Path:
+    return get_base_dir() / "runtime_state.json"
+
+
+def load_runtime_state() -> dict[str, object]:
+    state_file = get_runtime_state_file()
+    if not state_file.is_file():
+        return {}
+    try:
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_runtime_state(state: dict[str, object]) -> None:
+    state_file = get_runtime_state_file()
+    state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_runtime_state() -> None:
+    state_file = get_runtime_state_file()
+    try:
+        state_file.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def is_browser_session_closed_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(keyword in message for keyword in SESSION_CLOSED_ERROR_KEYWORDS)
+
+
+def is_browser_connected(browser) -> bool:
+    if browser is None:
+        return False
+    try:
+        return bool(browser.is_connected())
+    except Exception:
+        return False
 
 def get_shortcut_path() -> Path:
     if getattr(sys, "frozen", False):
@@ -1090,7 +1140,54 @@ def find_target_row(page, target: dict[str, object], glyph_map: dict[str, str]):
     return None, None
 
 
-def click_matching_online_chat(page) -> None:
+def build_candidate_key(candidate: dict[str, object]) -> str:
+    infoid = normalize_text(candidate.get("infoid", ""))
+    if infoid:
+        return f"infoid:{infoid}"
+    resumeid = normalize_text(candidate.get("resumeid", ""))
+    if resumeid:
+        return f"resumeid:{resumeid}"
+    name = normalize_text(candidate.get("name", ""))
+    age = candidate.get("age")
+    age_text = str(age) if isinstance(age, int) else normalize_text(candidate.get("age_text", ""))
+    return f"name:{name}|age:{age_text}"
+
+
+def prepare_cycle_runtime_state(cycle: int) -> dict[str, object]:
+    state = load_runtime_state()
+    if state.get("cycle") != cycle:
+        state = {"cycle": cycle, "completed_targets": [], "current_target": ""}
+        save_runtime_state(state)
+        return state
+    completed_targets = state.get("completed_targets")
+    if not isinstance(completed_targets, list):
+        state["completed_targets"] = []
+    current_target = state.get("current_target")
+    if not isinstance(current_target, str):
+        state["current_target"] = ""
+    save_runtime_state(state)
+    return state
+
+
+def set_current_runtime_target(cycle: int, target_key: str) -> dict[str, object]:
+    state = prepare_cycle_runtime_state(cycle)
+    state["current_target"] = target_key
+    save_runtime_state(state)
+    return state
+
+
+def mark_runtime_target_completed(cycle: int, target_key: str) -> dict[str, object]:
+    state = prepare_cycle_runtime_state(cycle)
+    completed_targets = list(state.get("completed_targets", []))
+    if target_key not in completed_targets:
+        completed_targets.append(target_key)
+    state["completed_targets"] = completed_targets
+    state["current_target"] = ""
+    save_runtime_state(state)
+    return state
+
+
+def click_matching_online_chat(page, cycle: int) -> None:
     close_known_dialogs(page)
     font_key = get_font_key(page)
     api_error = ""
@@ -1129,9 +1226,28 @@ def click_matching_online_chat(page) -> None:
             else:
                 skipped_reasons.append(f"{label} - {reason}")
 
+    state = prepare_cycle_runtime_state(cycle)
+    completed_targets = {str(item) for item in state.get("completed_targets", [])}
+    current_target = str(state.get("current_target", "") or "")
+    match_keys = [build_candidate_key(match) for match in matches]
+    if current_target and current_target not in match_keys:
+        print(f"断点目标已不在当前列表中，改为从下一位继续：{current_target}")
+        state["current_target"] = ""
+        save_runtime_state(state)
+        current_target = ""
+
     clicked: list[str] = []
     skipped_not_online: list[str] = []
+    resume_waiting = bool(current_target)
     for match in matches:
+        target_key = build_candidate_key(match)
+        if target_key in completed_targets:
+            continue
+        if resume_waiting and target_key != current_target:
+            continue
+        resume_waiting = False
+        set_current_runtime_target(cycle, target_key)
+
         close_known_dialogs(page)
         row = match.get("row")
         button = None
@@ -1144,6 +1260,8 @@ def click_matching_online_chat(page) -> None:
             row, button = find_target_row(page, match, glyph_map)
         if row is None or button is None:
             skipped_not_online.append(f"{match['name']}({match['age']}) - 页面未找到")
+            completed_targets.add(target_key)
+            mark_runtime_target_completed(cycle, target_key)
             continue
         success = False
         last_button_text = ""
@@ -1167,7 +1285,7 @@ def click_matching_online_chat(page) -> None:
             last_button_text = normalize_text(button.inner_text())
             button_html = button.evaluate("el => el.outerHTML")
             print(f"诊断：准备点击按钮 - 候选人: {match['name']} | 文本: {last_button_text} | HTML: {button_html}")
-            
+
             if is_success_chat_text(last_button_text):
                 success = True
                 break
@@ -1210,10 +1328,11 @@ def click_matching_online_chat(page) -> None:
             clicked.append(f"{match['name']}({match['age']})")
         else:
             final_reason = failure_reason or f"最终按钮是{last_button_text or '未识别'}"
-            skipped_not_online.append(
-                f"{match['name']}({match['age']}) - {final_reason}"
-            )
+            skipped_not_online.append(f"{match['name']}({match['age']}) - {final_reason}")
+        completed_targets.add(target_key)
+        mark_runtime_target_completed(cycle, target_key)
 
+    clear_runtime_state()
     print("筛选结果：")
     print(f"字体 key：{font_key or '未获取'}")
     print(f"年龄解码映射：{glyph_map}")
@@ -1240,7 +1359,7 @@ def click_matching_online_chat(page) -> None:
             print(f"- {item}")
 
 
-def run_once(context, page, login_timeout_seconds: float | None = None):
+def run_once(context, page, cycle: int, login_timeout_seconds: float | None = None):
     page.goto(TARGET_URL, wait_until="domcontentloaded")
     page = wait_for_login(context, page, timeout_seconds=login_timeout_seconds)
     if TARGET_URL not in page.url:
@@ -1249,48 +1368,12 @@ def run_once(context, page, login_timeout_seconds: float | None = None):
     page.wait_for_load_state("domcontentloaded")
     wait_for_candidate_list(page)
     page.bring_to_front()
-    click_matching_online_chat(page)
+    click_matching_online_chat(page, cycle)
     return page
 
 
-def run_periodically(context, page, run_duration_seconds: float | None) -> None:
-    cycle = 1
-    deadline = None if run_duration_seconds is None else time.time() + run_duration_seconds
-    while deadline is None or time.time() < deadline:
-        print(f"开始第 {cycle} 轮执行：{time.strftime('%Y-%m-%d %H:%M:%S')}")
-        if page.is_closed():
-            page = context.new_page()
-
-        remaining_seconds = None if deadline is None else max(0, deadline - time.time())
-        try:
-            page = run_once(context, page, login_timeout_seconds=remaining_seconds)
-        except Exception as exc:
-            print(f"第 {cycle} 轮执行失败：{exc}")
-        if deadline is None:
-            wait_seconds = REFRESH_INTERVAL_SECONDS
-            print(f"第 {cycle} 轮执行完成，{int(wait_seconds // 60)} 分钟后刷新重试，当前为永久执行。")
-        else:
-            remaining_seconds = deadline - time.time()
-            if remaining_seconds <= 0:
-                break
-            wait_seconds = min(REFRESH_INTERVAL_SECONDS, max(0, remaining_seconds))
-            print(
-                f"第 {cycle} 轮执行完成，"
-                f"{int(wait_seconds // 60)} 分钟后刷新重试，剩余运行 {int(remaining_seconds // 60)} 分钟。"
-            )
-        cycle += 1
-        time.sleep(wait_seconds)
-    if deadline is not None:
-        print("已到达设定运行时间，程序即将退出。")
-
-
-def open_58_with_cdp() -> None:
-    edge_path = find_edge_path()
-    user_data_dir = get_edge_user_data_dir()
-    ensure_compatible_edge_state(user_data_dir)
-    run_duration_seconds = prompt_run_duration_seconds()
+def connect_to_managed_edge(playwright, edge_path: Path, user_data_dir: Path):
     cdp_port = read_existing_cdp_port(user_data_dir) or read_running_edge_cdp_port(user_data_dir)
-
     if cdp_port is None:
         cdp_port = choose_cdp_port()
         edge_process = launch_edge(edge_path, user_data_dir, cdp_port)
@@ -1303,14 +1386,76 @@ def open_58_with_cdp() -> None:
     if not websocket_url:
         raise RuntimeError(f"未获取到 Edge 的 webSocketDebuggerUrl（{CDP_HOST}:{cdp_port}）。")
 
-    with sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.connect_over_cdp(websocket_url)
-        except Exception as exc:
-            raise RuntimeError(f"CDP 连接失败（{CDP_HOST}:{cdp_port}）：{exc}") from exc
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
+    try:
+        browser = playwright.chromium.connect_over_cdp(websocket_url)
+    except Exception as exc:
+        raise RuntimeError(f"CDP 连接失败（{CDP_HOST}:{cdp_port}）：{exc}") from exc
+    context = browser.contexts[0] if browser.contexts else browser.new_context()
+    page = context.pages[0] if context.pages else context.new_page()
+    return browser, context, page, edge_process, cdp_port
 
-        page = context.pages[0] if context.pages else context.new_page()
+
+def run_periodically(playwright, edge_path: Path, user_data_dir: Path, browser, context, page, run_duration_seconds: float | None) -> None:
+    cycle = 1
+    deadline = None if run_duration_seconds is None else time.time() + run_duration_seconds
+    while deadline is None or time.time() < deadline:
+        print(f"开始第 {cycle} 轮执行：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+        cycle_succeeded = False
+        while True:
+            remaining_seconds = None if deadline is None else max(0, deadline - time.time())
+            try:
+                if not is_browser_connected(browser):
+                    raise RuntimeError("browser has been closed")
+                if page.is_closed():
+                    page = context.new_page()
+                page = run_once(context, page, cycle, login_timeout_seconds=remaining_seconds)
+                cycle_succeeded = True
+                break
+            except Exception as exc:
+                if is_browser_session_closed_error(exc) or not is_browser_connected(browser):
+                    print(f"检测到浏览器连接已断开，正在重连并继续第 {cycle} 轮：{exc}")
+                    browser, context, page, _, cdp_port = connect_to_managed_edge(playwright, edge_path, user_data_dir)
+                    print(f"重连成功，调试地址：http://{CDP_HOST}:{cdp_port}")
+                    continue
+                clear_runtime_state()
+                print(f"第 {cycle} 轮执行失败：{exc}")
+                break
+        if deadline is None:
+            wait_seconds = REFRESH_INTERVAL_SECONDS
+            if cycle_succeeded:
+                print(f"第 {cycle} 轮执行完成，{int(wait_seconds // 60)} 分钟后刷新重试，当前为永久执行。")
+            else:
+                print(f"第 {cycle} 轮执行失败，{int(wait_seconds // 60)} 分钟后重试，当前为永久执行。")
+        else:
+            remaining_seconds = deadline - time.time()
+            if remaining_seconds <= 0:
+                break
+            wait_seconds = min(REFRESH_INTERVAL_SECONDS, max(0, remaining_seconds))
+            if cycle_succeeded:
+                print(
+                    f"第 {cycle} 轮执行完成，"
+                    f"{int(wait_seconds // 60)} 分钟后刷新重试，剩余运行 {int(remaining_seconds // 60)} 分钟。"
+                )
+            else:
+                print(
+                    f"第 {cycle} 轮执行失败，"
+                    f"{int(wait_seconds // 60)} 分钟后重试，剩余运行 {int(remaining_seconds // 60)} 分钟。"
+                )
+        cycle += 1
+        time.sleep(wait_seconds)
+    if deadline is not None:
+        print("已到达设定运行时间，程序即将退出。")
+
+
+def open_58_with_cdp() -> None:
+    edge_path = find_edge_path()
+    user_data_dir = get_edge_user_data_dir()
+    ensure_compatible_edge_state(user_data_dir)
+    run_duration_seconds = prompt_run_duration_seconds()
+
+    edge_process = None
+    with sync_playwright() as playwright:
+        browser, context, page, edge_process, cdp_port = connect_to_managed_edge(playwright, edge_path, user_data_dir)
         if run_duration_seconds is None:
             print("本次计划永久执行。")
         else:
@@ -1320,8 +1465,9 @@ def open_58_with_cdp() -> None:
         print(f"资料目录：{user_data_dir}")
         print(f"Profile 目录：{EDGE_PROFILE_DIRECTORY}")
         print(f"调试地址：http://{CDP_HOST}:{cdp_port}")
-        run_periodically(context, page, run_duration_seconds)
+        run_periodically(playwright, edge_path, user_data_dir, browser, context, page, run_duration_seconds)
 
+    clear_runtime_state()
     if edge_process and edge_process.poll() is None:
         print("程序退出后不会主动关闭 Edge。")
 
@@ -1339,3 +1485,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
