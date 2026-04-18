@@ -210,12 +210,41 @@ def read_existing_cdp_port(user_data_dir: Path) -> int | None:
     return None
 
 
+def parse_running_edge_cdp_port(command_lines: list[str], user_data_dir: Path, port_is_ready) -> int | None:
+    normalized_user_data_dir = str(user_data_dir).lower().replace("\\", "/").strip('"')
+    user_data_pattern = re.compile(r'--user-data-dir=(?:"([^"]+)"|([^\s]+))', re.IGNORECASE)
+    profile_pattern = re.compile(r'--profile-directory=(?:"([^"]+)"|([^\s]+))', re.IGNORECASE)
+    port_pattern = re.compile(r"--remote-debugging-port=(\d+)", re.IGNORECASE)
+
+    for command_line in command_lines:
+        user_data_match = user_data_pattern.search(command_line)
+        if not user_data_match:
+            continue
+        running_user_data_dir = (user_data_match.group(1) or user_data_match.group(2) or "").lower().replace("\\", "/").strip('"')
+        if running_user_data_dir != normalized_user_data_dir:
+            continue
+
+        profile_match = profile_pattern.search(command_line)
+        running_profile = profile_match.group(1) or profile_match.group(2) if profile_match else ""
+        if running_profile and running_profile.lower() != EDGE_PROFILE_DIRECTORY.lower():
+            continue
+
+        port_match = port_pattern.search(command_line)
+        if not port_match:
+            continue
+        cdp_port = int(port_match.group(1))
+        if port_is_ready(cdp_port):
+            return cdp_port
+    return None
+
+
 def read_running_edge_cdp_port(user_data_dir: Path) -> int | None:
     if os.name != "nt":
         return None
 
-    normalized_user_data_dir = str(user_data_dir).lower().replace("\\", "/")
     script = rf"""
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$OutputEncoding = [System.Text.UTF8Encoding]::new()
 Get-CimInstance Win32_Process |
   Where-Object {{ $_.Name -eq 'msedge.exe' -and $_.CommandLine }} |
   Select-Object -ExpandProperty CommandLine
@@ -225,25 +254,18 @@ Get-CimInstance Win32_Process |
             ["powershell", "-NoProfile", "-Command", script],
             check=True,
             capture_output=True,
+            encoding="utf-8",
+            errors="replace",
             text=True,
         )
     except (OSError, subprocess.SubprocessError):
         return None
 
-    for command_line in result.stdout.splitlines():
-        normalized = command_line.lower().replace("\\", "/")
-        if f"--user-data-dir={normalized_user_data_dir}" not in normalized:
-            continue
-        if f"--profile-directory={EDGE_PROFILE_DIRECTORY.lower()}" not in normalized:
-            continue
-        match = re.search(r"--remote-debugging-port=(\d+)", command_line)
-        if not match:
-            continue
-        cdp_port = int(match.group(1))
+    def port_is_ready(cdp_port: int) -> bool:
         version_data = read_cdp_version(cdp_port)
-        if version_data and version_data.get("webSocketDebuggerUrl"):
-            return cdp_port
-    return None
+        return bool(version_data and version_data.get("webSocketDebuggerUrl"))
+
+    return parse_running_edge_cdp_port(result.stdout.splitlines(), user_data_dir, port_is_ready)
 
 
 def ensure_compatible_edge_state(user_data_dir: Path) -> None:
