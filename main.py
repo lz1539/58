@@ -398,6 +398,10 @@ def is_login_page(url: str) -> bool:
     return any(keyword in normalized for keyword in LOGIN_URL_KEYWORDS)
 
 
+def is_target_page(page) -> bool:
+    return TARGET_URL in page.url
+
+
 def wait_for_login(context, page, timeout_seconds: float | None = 600):
     if not is_login_page(page.url):
         return page
@@ -419,6 +423,19 @@ def wait_for_login(context, page, timeout_seconds: float | None = 600):
             return page
         time.sleep(1)
     raise TimeoutError("等待用户登录超时，请重新运行程序后再试。")
+
+
+def ensure_target_page(context, page, login_timeout_seconds: float | None = None):
+    if is_target_page(page):
+        page.reload(wait_until="domcontentloaded")
+    else:
+        page.goto(TARGET_URL, wait_until="domcontentloaded")
+
+    page = wait_for_login(context, page, timeout_seconds=login_timeout_seconds)
+    if not is_target_page(page):
+        print("登录完成，正在进入人才管理页。")
+        page.goto(TARGET_URL, wait_until="domcontentloaded")
+    return page
 
 
 def normalize_text(value: object) -> str:
@@ -1360,11 +1377,7 @@ def click_matching_online_chat(page, cycle: int) -> None:
 
 
 def run_once(context, page, cycle: int, login_timeout_seconds: float | None = None):
-    page.goto(TARGET_URL, wait_until="domcontentloaded")
-    page = wait_for_login(context, page, timeout_seconds=login_timeout_seconds)
-    if TARGET_URL not in page.url:
-        print("登录完成，正在进入人才管理页。")
-        page.goto(TARGET_URL, wait_until="domcontentloaded")
+    page = ensure_target_page(context, page, login_timeout_seconds)
     page.wait_for_load_state("domcontentloaded")
     wait_for_candidate_list(page)
     page.bring_to_front()
