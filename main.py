@@ -1178,6 +1178,13 @@ def build_candidate_key(candidate: dict[str, object]) -> str:
     return f"name:{name}|age:{age_text}"
 
 
+def format_candidate_log_label(candidate: dict[str, object], target_key: str) -> str:
+    name = normalize_text(candidate.get("name", "")) or "未知候选人"
+    age = candidate.get("age")
+    age_text = str(age) if isinstance(age, int) else "年龄未知"
+    return f"{name}({age_text}) | key={target_key}"
+
+
 def prepare_cycle_runtime_state(cycle: int) -> dict[str, object]:
     state = load_runtime_state()
     if state.get("cycle") != cycle:
@@ -1255,6 +1262,11 @@ def click_matching_online_chat(page, cycle: int) -> None:
     completed_targets = {str(item) for item in state.get("completed_targets", [])}
     current_target = str(state.get("current_target", "") or "")
     match_keys = [build_candidate_key(match) for match in matches]
+    if matches:
+        print("命中候选诊断：")
+        for index, match in enumerate(matches, start=1):
+            target_key = build_candidate_key(match)
+            print(f"- 第 {index} 个：{format_candidate_log_label(match, target_key)}")
     if current_target and current_target not in match_keys:
         print(f"断点目标已不在当前列表中，改为从下一位继续：{current_target}")
         state["current_target"] = ""
@@ -1266,9 +1278,13 @@ def click_matching_online_chat(page, cycle: int) -> None:
     resume_waiting = bool(current_target)
     for match in matches:
         target_key = build_candidate_key(match)
+        log_label = format_candidate_log_label(match, target_key)
+        print(f"处理命中候选：{log_label}")
         if target_key in completed_targets:
+            print(f"跳过命中候选：{log_label}，原因：本轮已处理过相同 key。")
             continue
         if resume_waiting and target_key != current_target:
+            print(f"跳过命中候选：{log_label}，原因：等待恢复断点 {current_target}。")
             continue
         resume_waiting = False
         set_current_runtime_target(cycle, target_key)
@@ -1284,6 +1300,7 @@ def click_matching_online_chat(page, cycle: int) -> None:
         if row is None or button is None:
             row, button = find_target_row(page, match, glyph_map)
         if row is None or button is None:
+            print(f"跳过命中候选：{log_label}，原因：页面未找到对应行或按钮。")
             skipped_not_online.append(f"{match['name']}({match['age']}) - 页面未找到")
             completed_targets.add(target_key)
             mark_runtime_target_completed(cycle, target_key)
@@ -1302,10 +1319,12 @@ def click_matching_online_chat(page, cycle: int) -> None:
                     button = None
                 if button is None:
                     failure_reason = "目标按钮被遮挡"
+                    print(f"点击诊断：{log_label}，目标按钮被遮挡，重新查找按钮失败。")
                     break
                 button.scroll_into_view_if_needed()
                 if not is_button_click_target_clear(page, button):
                     failure_reason = "目标按钮被遮挡"
+                    print(f"点击诊断：{log_label}，目标按钮被遮挡。")
                     break
             last_button_text = normalize_text(button.inner_text())
             button_html = button.evaluate("el => el.outerHTML")
