@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -117,6 +118,13 @@ def is_browser_connected(browser) -> bool:
         return bool(browser.is_connected())
     except Exception:
         return False
+
+
+def round_up_to_refresh_interval(seconds: float) -> int:
+    if seconds <= 0:
+        return 0
+    return int(math.ceil(seconds / REFRESH_INTERVAL_SECONDS) * REFRESH_INTERVAL_SECONDS)
+
 
 def get_shortcut_path() -> Path:
     if getattr(sys, "frozen", False):
@@ -1411,11 +1419,23 @@ def connect_to_managed_edge(playwright, edge_path: Path, user_data_dir: Path):
 def run_periodically(playwright, edge_path: Path, user_data_dir: Path, browser, context, page, run_duration_seconds: float | None) -> None:
     cycle = 1
     deadline = None if run_duration_seconds is None else time.time() + run_duration_seconds
-    while deadline is None or time.time() < deadline:
+    allow_cycle_after_deadline = False
+    while True:
+        cycle_after_deadline = False
+        if deadline is not None and time.time() >= deadline:
+            if not allow_cycle_after_deadline:
+                break
+            allow_cycle_after_deadline = False
+            cycle_after_deadline = True
         print(f"开始第 {cycle} 轮执行：{time.strftime('%Y-%m-%d %H:%M:%S')}")
         cycle_succeeded = False
         while True:
-            remaining_seconds = None if deadline is None else max(0, deadline - time.time())
+            if deadline is None:
+                remaining_seconds = None
+            elif cycle_after_deadline:
+                remaining_seconds = REFRESH_INTERVAL_SECONDS
+            else:
+                remaining_seconds = round_up_to_refresh_interval(deadline - time.time())
             try:
                 if not is_browser_connected(browser):
                     raise RuntimeError("browser has been closed")
@@ -1441,18 +1461,20 @@ def run_periodically(playwright, edge_path: Path, user_data_dir: Path, browser, 
                 print(f"第 {cycle} 轮执行失败，{int(wait_seconds // 60)} 分钟后重试，当前为永久执行。")
         else:
             remaining_seconds = deadline - time.time()
-            if remaining_seconds <= 0:
+            rounded_remaining_seconds = round_up_to_refresh_interval(remaining_seconds)
+            if rounded_remaining_seconds <= 0:
                 break
-            wait_seconds = min(REFRESH_INTERVAL_SECONDS, max(0, remaining_seconds))
+            wait_seconds = REFRESH_INTERVAL_SECONDS
+            allow_cycle_after_deadline = wait_seconds > remaining_seconds
             if cycle_succeeded:
                 print(
                     f"第 {cycle} 轮执行完成，"
-                    f"{int(wait_seconds // 60)} 分钟后刷新重试，剩余运行 {int(remaining_seconds // 60)} 分钟。"
+                    f"{int(wait_seconds // 60)} 分钟后刷新重试，剩余运行 {int(rounded_remaining_seconds // 60)} 分钟。"
                 )
             else:
                 print(
                     f"第 {cycle} 轮执行失败，"
-                    f"{int(wait_seconds // 60)} 分钟后重试，剩余运行 {int(remaining_seconds // 60)} 分钟。"
+                    f"{int(wait_seconds // 60)} 分钟后重试，剩余运行 {int(rounded_remaining_seconds // 60)} 分钟。"
                 )
         cycle += 1
         time.sleep(wait_seconds)
