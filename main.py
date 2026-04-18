@@ -893,7 +893,8 @@ def normalize_candidate_from_api(item: dict[str, object], glyph_map: dict[str, s
         "name": name,
         "sex": sex,
         "age": age,
-        "infoid": normalize_text(pick_item_value(item, "infoId", "resumeId", "id")),
+        "infoid": normalize_text(pick_item_value(item, "infoId", "id")),
+        "resumeid": normalize_text(pick_item_value(item, "resumeId")),
         "chat_state": chat_state,
         "chat_text": chat_text,
         "raw": item,
@@ -997,8 +998,6 @@ def extract_row_snapshot(row, glyph_map: dict[str, str]) -> dict[str, object]:
     if not selected_button_text:
         selected_button_text = next((text for text in button_texts if "沟通" in text and not any(kw in text for kw in CHAT_EXCLUDE_KEYWORDS)), button_texts[0] if button_texts else "")
 
-    combined_hint_text = " ".join([normalize_text(snapshot.get("html", ""))] + [normalize_text(value) for value in snapshot.get("hints", [])])
-    infoid_match = re.search(r"(?i)(?:infoid|resumeid|data-infoid|data-id)[^0-9]{0,8}(\d{5,})", combined_hint_text)
     return {
         "name": normalize_text(snapshot.get("name", "")),
         "age_text": age_text,
@@ -1007,7 +1006,7 @@ def extract_row_snapshot(row, glyph_map: dict[str, str]) -> dict[str, object]:
         "button_texts": button_texts,
         "button_text": selected_button_text,
         "text": full_text,
-        "infoid": normalize_text(snapshot.get("infoId", "")) or (infoid_match.group(1) if infoid_match else ""),
+        "infoid": normalize_text(snapshot.get("infoId", "")),
         "resumeid": normalize_text(snapshot.get("resumeId", "")),
     }
 
@@ -1058,7 +1057,7 @@ def merge_candidate(page_candidate: dict[str, object], api_candidate: dict[str, 
     merged = dict(page_candidate)
     if not api_candidate:
         return merged
-    for key in ("name", "sex", "age", "infoid"):
+    for key in ("name", "sex", "age", "infoid", "resumeid"):
         if merged.get(key) in (None, "", 0):
             merged[key] = api_candidate.get(key)
     merged["api_chat_state"] = api_candidate.get("chat_state")
@@ -1169,8 +1168,8 @@ def find_target_row(page, target: dict[str, object], glyph_map: dict[str, str]):
             snapshot = extract_row_snapshot(row, glyph_map)
         except Exception:
             continue
-        target_infoid = normalize_text(target.get("infoid", ""))
-        if target_infoid and snapshot.get("infoid") == target_infoid:
+        target_resumeid = normalize_text(target.get("resumeid", ""))
+        if target_resumeid and snapshot.get("resumeid") == target_resumeid:
             button = find_real_chat_button(row)
             if button is not None:
                 return row, button
@@ -1188,9 +1187,6 @@ def find_target_row(page, target: dict[str, object], glyph_map: dict[str, str]):
 
 
 def build_candidate_key(candidate: dict[str, object]) -> str:
-    infoid = normalize_text(candidate.get("infoid", ""))
-    if infoid:
-        return f"infoid:{infoid}"
     resumeid = normalize_text(candidate.get("resumeid", ""))
     if resumeid:
         return f"resumeid:{resumeid}"
@@ -1253,7 +1249,7 @@ def click_matching_online_chat(page, cycle: int) -> None:
     glyph_map = build_age_glyph_map(page, [str(item.get("age", "")) for item in items], font_key=font_key) if items else {}
 
     api_candidates = [normalize_candidate_from_api(item, glyph_map) for item in items]
-    api_by_infoid = {str(item["infoid"]): item for item in api_candidates if item.get("infoid")}
+    api_by_resumeid = {str(item["resumeid"]): item for item in api_candidates if item.get("resumeid")}
     api_by_name = {str(item["name"]): item for item in api_candidates if item.get("name")}
 
     page_candidates = build_page_candidates(page, glyph_map)
@@ -1262,8 +1258,8 @@ def click_matching_online_chat(page, cycle: int) -> None:
     skipped_unknown_age: list[str] = []
     for page_candidate in page_candidates:
         api_candidate = None
-        if page_candidate.get("infoid"):
-            api_candidate = api_by_infoid.get(str(page_candidate["infoid"]))
+        if page_candidate.get("resumeid"):
+            api_candidate = api_by_resumeid.get(str(page_candidate["resumeid"]))
         if api_candidate is None and page_candidate.get("name"):
             api_candidate = api_by_name.get(str(page_candidate["name"]))
         merged = merge_candidate(page_candidate, api_candidate)
