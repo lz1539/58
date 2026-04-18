@@ -12,4 +12,4 @@ dist/
 *.spec
 
 # Runtime browser profile
-edge_profile/
+edge_profile*/
