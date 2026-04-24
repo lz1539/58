@@ -86,5 +86,5 @@ uv run server/disable_switch_server.py
 - `edge_profile` 会保留登录态、Cookie 等独立浏览器数据
 - 程序会自动选择可用的 CDP 端口，避免与本机已有 Edge 调试实例冲突
 - 如果运行中浏览器连接断开，程序会自动重新接管 Edge，并按当前轮次的断点继续
-- 到达设定运行时间后，是否自动关闭当前 `edge_profile` 对应的 Edge，取决于菜单中的开关设置
+- 到达设定运行时间后，是否自动关闭当前 `edge_profile` 对应的全部 Edge 进程，取决于菜单中的开关设置
 

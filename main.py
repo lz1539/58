@@ -455,27 +455,17 @@ def close_managed_edge_processes(user_data_dir: Path) -> None:
     if os.name != "nt":
         return
 
-    normalized_user_data_dir = str(user_data_dir).lower().replace("\\", "/")
-    script = rf"""
+    script = """
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $OutputEncoding = [System.Text.UTF8Encoding]::new()
-$normalizedUserDataDir = '{normalized_user_data_dir.replace("'", "''")}'
-$normalizedProfileDirectory = '{EDGE_PROFILE_DIRECTORY.lower().replace("'", "''")}'
-$processes = Get-CimInstance Win32_Process |
+Get-CimInstance Win32_Process |
   Where-Object {{ $_.Name -eq 'msedge.exe' -and $_.CommandLine }} |
-  Select-Object ProcessId, CommandLine
-
-foreach ($process in $processes) {{
-  $commandLine = $process.CommandLine.ToLower().Replace('\', '/')
-  if ($commandLine -notlike "*--user-data-dir=$normalizedUserDataDir*") {{
-    continue
-  }}
-  if ($commandLine -notlike "*--profile-directory=$normalizedProfileDirectory*") {{
-    continue
-  }}
-  Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-  Write-Output $process.ProcessId
-}}
+  Select-Object ProcessId, CommandLine |
+  ForEach-Object {
+    $line = $_.CommandLine
+    if (-not $line) { $line = '' }
+    Write-Output ("{0}`t{1}" -f $_.ProcessId, $line)
+  }
 """
     try:
         result = subprocess.run(
@@ -487,14 +477,49 @@ foreach ($process in $processes) {{
             text=True,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        print(f"关闭当前数据目录下的 Edge 失败：{exc}")
+        print(f"读取当前数据目录下的 Edge 进程失败：{exc}")
         return
 
-    closed_process_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if closed_process_ids:
-        print(f"已关闭当前数据目录下的 Edge 进程：{', '.join(closed_process_ids)}")
-    else:
+    matched_process_ids = parse_managed_edge_process_ids(result.stdout.splitlines(), user_data_dir)
+    if not matched_process_ids:
         print("未发现当前数据目录下需要关闭的 Edge 进程。")
+        return
+
+    for process_id in matched_process_ids:
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {process_id} -Force"],
+                check=True,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"关闭 Edge 进程失败：{process_id}，{exc}")
+
+    print(f"已关闭当前数据目录下的 Edge 进程：{', '.join(matched_process_ids)}")
+
+
+def parse_managed_edge_process_ids(command_lines: list[str], user_data_dir: Path) -> list[str]:
+    normalized_user_data_dir = str(user_data_dir).lower().replace("\\", "/").strip('"')
+    user_data_pattern = re.compile(r'--user-data-dir=(?:"([^"]+)"|([^\s]+))', re.IGNORECASE)
+    matched_process_ids: list[str] = []
+
+    for line in command_lines:
+        parts = line.split("\t", 1)
+        process_id = parts[0].strip() if parts else ""
+        command_line = parts[1] if len(parts) > 1 else ""
+        if not process_id or not command_line:
+            continue
+        user_data_match = user_data_pattern.search(command_line)
+        if not user_data_match:
+            continue
+        running_user_data_dir = (user_data_match.group(1) or user_data_match.group(2) or "").lower().replace("\\", "/").strip('"')
+        if running_user_data_dir != normalized_user_data_dir:
+            continue
+        matched_process_ids.append(process_id)
+    return matched_process_ids
 
 
 def wait_for_cdp_ready(
