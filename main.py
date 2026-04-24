@@ -80,6 +80,10 @@ def get_runtime_state_file() -> Path:
     return get_base_dir() / "runtime_state.json"
 
 
+def get_app_config_file() -> Path:
+    return get_base_dir() / "app_config.json"
+
+
 def load_runtime_state() -> dict[str, object]:
     state_file = get_runtime_state_file()
     if not state_file.is_file():
@@ -104,6 +108,29 @@ def clear_runtime_state() -> None:
         return
     except OSError:
         return
+
+
+def load_app_config() -> dict[str, object]:
+    config_file = get_app_config_file()
+    if not config_file.is_file():
+        return {"auto_close_edge_on_exit": False}
+    try:
+        payload = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"auto_close_edge_on_exit": False}
+    if not isinstance(payload, dict):
+        return {"auto_close_edge_on_exit": False}
+    return {
+        "auto_close_edge_on_exit": bool(payload.get("auto_close_edge_on_exit", False)),
+    }
+
+
+def save_app_config(config: dict[str, object]) -> None:
+    config_file = get_app_config_file()
+    normalized_config = {
+        "auto_close_edge_on_exit": bool(config.get("auto_close_edge_on_exit", False)),
+    }
+    config_file.write_text(json.dumps(normalized_config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def is_browser_session_closed_error(exc: Exception) -> bool:
@@ -351,10 +378,12 @@ def wait_for_enter(prompt: str) -> None:
         pass
 
 
-def prompt_run_duration_seconds() -> float | None:
+def prompt_run_duration_seconds() -> tuple[float | None, bool]:
+    config = load_app_config()
+    auto_close_edge_on_exit = bool(config.get("auto_close_edge_on_exit", False))
     if sys.stdin is None or not sys.stdin.isatty():
         print(f"当前为非交互环境，默认运行 {DEFAULT_RUN_HOURS} 小时。")
-        return DEFAULT_RUN_HOURS * 3600
+        return DEFAULT_RUN_HOURS * 3600, auto_close_edge_on_exit
 
     options: list[tuple[str, str, float | None]] = [
         ("1", "1 小时", 1 * 3600),
@@ -365,25 +394,78 @@ def prompt_run_duration_seconds() -> float | None:
         ("6", "6 小时", 6 * 3600),
         ("7", "7 小时", 7 * 3600),
         ("8", "8 小时", 8 * 3600),
-        ("9", "永久执行", None),
+        ("0", "永久执行", None),
     ]
-    print("请选择本次运行时长：")
-    for key, label, _ in options:
-        default_mark = "（默认）" if key == "1" else ""
-        print(f"{key}. {label}{default_mark}")
-
     while True:
+        print("请选择本次运行时长：")
+        for key, label, _ in options:
+            default_mark = "（默认）" if key == "1" else ""
+            print(f"{key}. {label}{default_mark}")
+        current_status = "开" if auto_close_edge_on_exit else "关"
+        print(f"9. 切换“到时自动关闭浏览器”（当前：{current_status}）")
+
         try:
             raw = input("请输入选项编号：").strip()
         except EOFError:
             print(f"\n未读取到输入，默认运行 {DEFAULT_RUN_HOURS} 小时。")
-            return DEFAULT_RUN_HOURS * 3600
+            return DEFAULT_RUN_HOURS * 3600, auto_close_edge_on_exit
         if not raw:
             raw = "1"
+        if raw == "9":
+            auto_close_edge_on_exit = not auto_close_edge_on_exit
+            save_app_config({"auto_close_edge_on_exit": auto_close_edge_on_exit})
+            print(f"已切换“到时自动关闭浏览器”为：{'开' if auto_close_edge_on_exit else '关'}")
+            continue
         for key, _, seconds in options:
             if raw == key:
-                return seconds
-        print("输入无效，请输入 1-9。")
+                return seconds, auto_close_edge_on_exit
+        print("输入无效，请输入 0-9。")
+
+
+def close_managed_edge_processes(user_data_dir: Path) -> None:
+    if os.name != "nt":
+        return
+
+    normalized_user_data_dir = str(user_data_dir).lower().replace("\\", "/")
+    script = rf"""
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$OutputEncoding = [System.Text.UTF8Encoding]::new()
+$normalizedUserDataDir = '{normalized_user_data_dir.replace("'", "''")}'
+$normalizedProfileDirectory = '{EDGE_PROFILE_DIRECTORY.lower().replace("'", "''")}'
+$processes = Get-CimInstance Win32_Process |
+  Where-Object {{ $_.Name -eq 'msedge.exe' -and $_.CommandLine }} |
+  Select-Object ProcessId, CommandLine
+
+foreach ($process in $processes) {{
+  $commandLine = $process.CommandLine.ToLower().Replace('\', '/')
+  if ($commandLine -notlike "*--user-data-dir=$normalizedUserDataDir*") {{
+    continue
+  }}
+  if ($commandLine -notlike "*--profile-directory=$normalizedProfileDirectory*") {{
+    continue
+  }}
+  Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+  Write-Output $process.ProcessId
+}}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"关闭当前数据目录下的 Edge 失败：{exc}")
+        return
+
+    closed_process_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if closed_process_ids:
+        print(f"已关闭当前数据目录下的 Edge 进程：{', '.join(closed_process_ids)}")
+    else:
+        print("未发现当前数据目录下需要关闭的 Edge 进程。")
 
 
 def wait_for_cdp_ready(
@@ -1453,7 +1535,16 @@ def connect_to_managed_edge(playwright, edge_path: Path, user_data_dir: Path):
     return browser, context, page, edge_process, cdp_port
 
 
-def run_periodically(playwright, edge_path: Path, user_data_dir: Path, browser, context, page, run_duration_seconds: float | None) -> None:
+def run_periodically(
+    playwright,
+    edge_path: Path,
+    user_data_dir: Path,
+    browser,
+    context,
+    page,
+    run_duration_seconds: float | None,
+    auto_close_edge_on_exit: bool,
+) -> None:
     cycle = 1
     deadline = None if run_duration_seconds is None else time.time() + run_duration_seconds
     allow_cycle_after_deadline = False
@@ -1517,13 +1608,15 @@ def run_periodically(playwright, edge_path: Path, user_data_dir: Path, browser, 
         time.sleep(wait_seconds)
     if deadline is not None:
         print("已到达设定运行时间，程序即将退出。")
+        if auto_close_edge_on_exit:
+            close_managed_edge_processes(user_data_dir)
 
 
 def open_58_with_cdp() -> None:
     edge_path = find_edge_path()
     user_data_dir = get_edge_user_data_dir()
     ensure_compatible_edge_state(user_data_dir)
-    run_duration_seconds = prompt_run_duration_seconds()
+    run_duration_seconds, auto_close_edge_on_exit = prompt_run_duration_seconds()
 
     edge_process = None
     with sync_playwright() as playwright:
@@ -1532,15 +1625,16 @@ def open_58_with_cdp() -> None:
             print("本次计划永久执行。")
         else:
             print(f"本次计划运行 {run_duration_seconds / 3600:g} 小时。")
+        print(f"到时自动关闭浏览器：{'开' if auto_close_edge_on_exit else '关'}")
         print(f"已通过 CDP 接管 Edge，并打开：{TARGET_URL}")
         print(f"Edge 路径：{edge_path}")
         print(f"资料目录：{user_data_dir}")
         print(f"Profile 目录：{EDGE_PROFILE_DIRECTORY}")
         print(f"调试地址：http://{CDP_HOST}:{cdp_port}")
-        run_periodically(playwright, edge_path, user_data_dir, browser, context, page, run_duration_seconds)
+        run_periodically(playwright, edge_path, user_data_dir, browser, context, page, run_duration_seconds, auto_close_edge_on_exit)
 
     clear_runtime_state()
-    if edge_process and edge_process.poll() is None:
+    if edge_process and edge_process.poll() is None and not auto_close_edge_on_exit:
         print("程序退出后不会主动关闭 Edge。")
 
 
