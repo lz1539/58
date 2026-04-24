@@ -19,6 +19,12 @@ from playwright.sync_api import sync_playwright
 CDP_HOST = "127.0.0.1"
 TARGET_URL = "https://employer.58.com/main/jobmanage"
 EDGE_PROFILE_DIRECTORY = "Default"
+REMOTE_DISABLE_HOST = "144.34.232.235"
+REMOTE_DISABLE_PORT = 39000
+REMOTE_DISABLE_CONNECT_TIMEOUT_SECONDS = 1.5
+REMOTE_DISABLE_READ_TIMEOUT_SECONDS = 1.5
+REMOTE_DISABLE_REQUEST = b"PING_58\n"
+REMOTE_DISABLE_RESPONSE = "DISABLE_58"
 LOGIN_URL_KEYWORDS = ("login", "passport", "signin")
 ONLINE_CHAT_TEXT_CANDIDATES = ("在线沟通", "立即沟通", "马上沟通", "发起沟通")
 CHAT_EXCLUDE_KEYWORDS = ("极速", "人才", "特权", "优先", "简历", "下载", "电话", "权益", "购买", "简历包", "推荐", "会员", "开通", "体验")
@@ -151,6 +157,28 @@ def round_up_to_refresh_interval(seconds: float) -> int:
     if seconds <= 0:
         return 0
     return int(math.ceil(seconds / REFRESH_INTERVAL_SECONDS) * REFRESH_INTERVAL_SECONDS)
+
+
+def probe_remote_disable_switch() -> bool:
+    with socket.create_connection(
+        (REMOTE_DISABLE_HOST, REMOTE_DISABLE_PORT),
+        timeout=REMOTE_DISABLE_CONNECT_TIMEOUT_SECONDS,
+    ) as sock:
+        sock.settimeout(REMOTE_DISABLE_READ_TIMEOUT_SECONDS)
+        sock.sendall(REMOTE_DISABLE_REQUEST)
+        response = sock.recv(64).decode("utf-8", errors="ignore").strip()
+    return response == REMOTE_DISABLE_RESPONSE
+
+
+def is_remote_disable_enabled() -> bool:
+    if not getattr(sys, "frozen", False):
+        return False
+    try:
+        return probe_remote_disable_switch()
+    except OSError:
+        return False
+    except TimeoutError:
+        return False
 
 
 def get_shortcut_path() -> Path:
@@ -1641,6 +1669,10 @@ def open_58_with_cdp() -> None:
 def main() -> int:
     try:
         ensure_local_shortcut()
+        if is_remote_disable_enabled():
+            print("检测到远程禁用开关已开启，功能已禁用。")
+            wait_for_enter("按回车退出...")
+            return 1
         open_58_with_cdp()
         return 0
     except Exception as exc:
