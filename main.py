@@ -423,14 +423,15 @@ def prompt_run_duration_seconds() -> tuple[float | None, bool]:
         ("7", "7 小时", 7 * 3600),
         ("8", "8 小时", 8 * 3600),
         ("0", "永久执行", None),
+        ("10", "测试运行 1 分钟", 60),
     ]
     while True:
         print("请选择本次运行时长：")
         for key, label, _ in options:
             default_mark = "（默认）" if key == "1" else ""
             print(f"{key}. {label}{default_mark}")
-        current_status = "开" if auto_close_edge_on_exit else "关"
-        print(f"9. 切换“到时自动关闭浏览器”（当前：{current_status}）")
+        current_status = "关浏览器" if auto_close_edge_on_exit else "不关浏览器"
+        print(f"9. 到时关闭浏览器开关（当前：{current_status}）")
 
         try:
             raw = input("请输入选项编号：").strip()
@@ -442,12 +443,12 @@ def prompt_run_duration_seconds() -> tuple[float | None, bool]:
         if raw == "9":
             auto_close_edge_on_exit = not auto_close_edge_on_exit
             save_app_config({"auto_close_edge_on_exit": auto_close_edge_on_exit})
-            print(f"已切换“到时自动关闭浏览器”为：{'开' if auto_close_edge_on_exit else '关'}")
+            print(f"已切换为：{'到时关浏览器' if auto_close_edge_on_exit else '到时不关浏览器'}")
             continue
         for key, _, seconds in options:
             if raw == key:
                 return seconds, auto_close_edge_on_exit
-        print("输入无效，请输入 0-9。")
+        print("输入无效，请输入 0-10。")
 
 
 def close_managed_edge_processes(user_data_dir: Path) -> None:
@@ -1620,18 +1621,26 @@ def run_periodically(
             rounded_remaining_seconds = round_up_to_refresh_interval(remaining_seconds)
             if rounded_remaining_seconds <= 0:
                 break
-            wait_seconds = REFRESH_INTERVAL_SECONDS
-            allow_cycle_after_deadline = wait_seconds > remaining_seconds
-            if cycle_succeeded:
-                print(
-                    f"第 {cycle} 轮执行完成，"
-                    f"{int(wait_seconds // 60)} 分钟后刷新重试，剩余运行 {int(rounded_remaining_seconds // 60)} 分钟。"
-                )
+            if run_duration_seconds < REFRESH_INTERVAL_SECONDS:
+                wait_seconds = max(0, int(math.ceil(remaining_seconds)))
+                allow_cycle_after_deadline = False
+                if cycle_succeeded:
+                    print(f"第 {cycle} 轮执行完成，{wait_seconds} 秒后退出测试运行。")
+                else:
+                    print(f"第 {cycle} 轮执行失败，{wait_seconds} 秒后退出测试运行。")
             else:
-                print(
-                    f"第 {cycle} 轮执行失败，"
-                    f"{int(wait_seconds // 60)} 分钟后重试，剩余运行 {int(rounded_remaining_seconds // 60)} 分钟。"
-                )
+                wait_seconds = REFRESH_INTERVAL_SECONDS
+                allow_cycle_after_deadline = wait_seconds > remaining_seconds
+                if cycle_succeeded:
+                    print(
+                        f"第 {cycle} 轮执行完成，"
+                        f"{int(wait_seconds // 60)} 分钟后刷新重试，剩余运行 {int(rounded_remaining_seconds // 60)} 分钟。"
+                    )
+                else:
+                    print(
+                        f"第 {cycle} 轮执行失败，"
+                        f"{int(wait_seconds // 60)} 分钟后重试，剩余运行 {int(rounded_remaining_seconds // 60)} 分钟。"
+                    )
         cycle += 1
         time.sleep(wait_seconds)
     if deadline is not None:
