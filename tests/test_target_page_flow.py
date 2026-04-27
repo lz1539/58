@@ -22,6 +22,18 @@ class FakePage:
         self.calls.append("bring_to_front")
 
 
+class FetchCandidateItemsTest(unittest.TestCase):
+    def test_fetch_candidate_items_timeout_raises_special_error(self):
+        class TimeoutPage:
+            def evaluate(self, _script, _api_url):
+                return {"__fetch_timeout__": "人才列表接口请求超时：15 秒"}
+
+        with self.assertRaises(main.CandidateFetchTimeoutError) as cm:
+            main.fetch_candidate_items(TimeoutPage(), "font-key")
+
+        self.assertEqual(str(cm.exception), "人才列表接口请求超时：15 秒")
+
+
 class TargetPageFlowTest(unittest.TestCase):
     def test_target_page_is_reloaded_before_business_flow(self):
         page = FakePage(main.TARGET_URL)

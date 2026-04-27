@@ -46,6 +46,7 @@ ROW_FALLBACK_SELECTORS = (
 )
 REFRESH_INTERVAL_SECONDS = 600
 DEFAULT_RUN_HOURS = 1
+PAYCHAT_FETCH_TIMEOUT_MS = 15000
 AGE_GLYPH_MAP_CACHE: dict[str, dict[str, str]] = {}
 SESSION_CLOSED_ERROR_KEYWORDS = (
     "target page, context or browser has been closed",
@@ -54,6 +55,10 @@ SESSION_CLOSED_ERROR_KEYWORDS = (
     "connection closed",
     "browser.disconnected",
 )
+
+
+class CandidateFetchTimeoutError(TimeoutError):
+    pass
 
 
 def find_edge_path() -> Path:
@@ -854,16 +859,31 @@ def fetch_candidate_items(page, font_key: str | None) -> list[dict[str, object]]
     api_url = build_paychat_api_url(font_key)
     script = """
     async (url) => {
-      const resp = await fetch(url, { credentials: 'include' });
-      if (!resp.ok) {
-        return { __fetch_error__: `${resp.status} ${resp.statusText}` };
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), %d);
+      try {
+        const resp = await fetch(url, { credentials: 'include', signal: controller.signal });
+        if (!resp.ok) {
+          return { __fetch_error__: `${resp.status} ${resp.statusText}` };
+        }
+        return await resp.json();
+      } catch (error) {
+        if (error && error.name === 'AbortError') {
+          return { __fetch_timeout__: `人才列表接口请求超时：%d 秒` };
+        }
+        const name = error && error.name ? String(error.name) : 'Error';
+        const message = error && error.message ? String(error.message) : String(error || '');
+        return { __fetch_error__: `${name}: ${message}` };
+      } finally {
+        clearTimeout(timeoutId);
       }
-      return await resp.json();
     }
-    """
+    """ % (PAYCHAT_FETCH_TIMEOUT_MS, PAYCHAT_FETCH_TIMEOUT_MS // 1000)
     payload = page.evaluate(script, api_url)
     if not isinstance(payload, dict):
         raise RuntimeError("人才列表接口返回异常，返回结果不是对象。")
+    if payload.get("__fetch_timeout__"):
+        raise CandidateFetchTimeoutError(str(payload["__fetch_timeout__"]))
     if payload.get("__fetch_error__"):
         raise RuntimeError(f"人才列表接口请求失败：{payload['__fetch_error__']}")
     data = payload.get("data")
@@ -1631,6 +1651,10 @@ def run_periodically(
                     print(f"检测到浏览器连接已断开，正在重连并继续第 {cycle} 轮：{exc}")
                     browser, context, page, _, cdp_port = connect_to_managed_edge(playwright, edge_path, user_data_dir)
                     print(f"重连成功，调试地址：http://{CDP_HOST}:{cdp_port}")
+                    continue
+                if isinstance(exc, CandidateFetchTimeoutError):
+                    clear_runtime_state()
+                    print(f"第 {cycle} 轮人才列表接口请求超时，正在从页面刷新开始重试：{exc}")
                     continue
                 clear_runtime_state()
                 print(f"第 {cycle} 轮执行失败：{exc}")

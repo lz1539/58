@@ -44,6 +44,46 @@ class InteractiveInput(StringIO):
 
 
 class PeriodicScheduleTest(unittest.TestCase):
+    def test_fetch_timeout_retries_same_cycle_from_run_once_start(self):
+        fake_time = FakeTime()
+        cycles: list[int] = []
+
+        original_time = main.time.time
+        original_sleep = main.time.sleep
+        original_strftime = main.time.strftime
+        original_run_once = main.run_once
+        try:
+            main.time.time = fake_time.time
+            main.time.sleep = fake_time.sleep
+            main.time.strftime = fake_time.strftime
+
+            def fake_run_once(_context, page, cycle, login_timeout_seconds=None):
+                cycles.append(cycle)
+                if len(cycles) == 1:
+                    raise main.CandidateFetchTimeoutError("接口请求超时")
+                fake_time.current += 2
+                return page
+
+            main.run_once = fake_run_once
+            main.run_periodically(
+                object(),
+                object(),
+                object(),
+                FakeBrowser(),
+                FakeContext(),
+                FakePage(),
+                60,
+                False,
+            )
+        finally:
+            main.time.time = original_time
+            main.time.sleep = original_sleep
+            main.time.strftime = original_strftime
+            main.run_once = original_run_once
+
+        self.assertEqual(cycles, [1, 1])
+        self.assertEqual(fake_time.sleeps, [58])
+
     def test_short_final_remainder_is_rounded_and_allows_next_cycle(self):
         fake_time = FakeTime()
         cycles: list[int] = []
